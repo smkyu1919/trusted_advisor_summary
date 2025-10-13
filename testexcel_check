@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#Github v1.2
+#Github v1.3
 
 """
 Trusted Advisor 체크 메타 + 결과 요약(경고/주의/정상/제외) + 리소스 상세(인스턴스ID 등) 엑셀로 출력
