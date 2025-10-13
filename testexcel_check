@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#Github v1.3
+#Github v1.4 (final)
 
 """
-Trusted Advisor 체크 메타 + 결과 요약(경고/주의/정상/제외) + 리소스 상세(인스턴스ID 등) 엑셀로 출력
-- All 시트: 전체 요약
-- Pillar별 시트: 카테고리별 요약
-- Details 시트: 리소스별 상세(리전, 리소스ID, 상태, 메타데이터, 제외여부)
+Trusted Advisor 체크 결과를 단일 시트(All)로 출력
+- Category 순 정렬
+- 각 체크 행에 '리소스 값' 컬럼 추가:
+    '정상 : r1, r2\\n주의 : r3\\n경고 : r4, r5' 형식
+- 제외(isSuppressed=True)는 카운트만 '제외'에 반영하고 '리소스 값'에는 포함하지 않음
 """
 
 import sys
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, DefaultDict
+from collections import defaultdict
 from pathlib import Path
+
 import boto3
 import botocore
 import pandas as pd
+from openpyxl.styles import Alignment
+from openpyxl.utils import get_column_letter
 
 OUTPUT_XLSX = "trusted_advisor_checks.xlsx"
 
@@ -26,7 +31,7 @@ LANGUAGE = "en"
 SUPPORT_REGION = "us-east-1"
 
 # ✔ (예시) 명시적 자격 (하드코딩 권장X: 환경변수/프로파일 사용 권장)
-#    실제 운영에서는 환경변수(AWS_PROFILE, AWS_ACCESS_KEY_ID 등) 또는 SSO/Role 사용 권장
+#    실제 운영에서는 환경변수/프로파일/SSO/AssumeRole 권장
 session = boto3.Session(
     aws_access_key_id="계정 Access Key",
     aws_secret_access_key="계정 Secret Key",
@@ -45,15 +50,11 @@ PRETTY_PILLAR: Dict[str, str] = {
     "service_quotas": "Service Limits",
 }
 
-# TA status → 한글 표기(요청한 치환)
-# - error   → 경고(=조치 권고)
-# - warning → 주의(=조사 권고)
-# - ok      → 정상(=발견된 문제 없음)
+# TA status → 한글 표기(요청 치환)
 STATUS_MAP = {
-    "error": "경고",
-    "warning": "주의",
-    "ok": "정상",
-    # not_available/none/'' 등은 '미확인' 처리
+    "error": "나쁨",    # (= 조치 권고)
+    "warning": "보통",  # (= 조사 권고)
+    "ok": "좋음",       # (= 발견된 문제 없음)
 }
 
 def pretty_pillar_name(raw: str) -> str:
@@ -66,17 +67,17 @@ def backoff_sleep(i: int):
     """간단한 지수 백오프 (최대 10초)"""
     time.sleep(min(2 ** i, 10))
 
-def fetch_check_result_with_details(
+def fetch_check_result_summary_and_ids(
     support, check_id: str
-) -> Tuple[int, int, int, int, str, List[dict]]:
+) -> Tuple[int, int, int, int, str, Dict[str, List[str]]]:
     """
     각 체크에 대해:
       - 경고(error), 주의(warning), 정상(ok), 제외(isSuppressed=True) 카운트 집계
-      - 체크 전체 상태(요약) → 한글로 매핑(경고/주의/정상/미확인)
-      - 리소스 상세(리전, 리소스ID, 상태, 메타데이터, 제외여부) 리스트 반환
+      - 체크 전체 상태(요약) → 한글 매핑(경고/주의/정상/미확인)
+      - 상태별 리소스ID 목록(정상/주의/경고) 반환 (제외는 목록에 포함하지 않음)
 
     Returns:
-        (error_cnt, warn_cnt, ok_cnt, excluded_cnt, overall_ko, detailed_rows)
+        (error_cnt, warn_cnt, ok_cnt, excluded_cnt, overall_ko, status_to_ids)
     """
     warn_count = 0
     error_count = 0
@@ -85,10 +86,10 @@ def fetch_check_result_with_details(
 
     next_token = None
     result_status_raw = None
-    detailed_rows: List[dict] = []
+    status_to_ids: DefaultDict[str, List[str]] = defaultdict(list)
 
-    # 페이지네이션 처리
     while True:
+        # 페이지네이션 + 스로틀링 대비
         for attempt in range(6):
             try:
                 kwargs = {"checkId": check_id, "language": LANGUAGE}
@@ -113,36 +114,25 @@ def fetch_check_result_with_details(
         flagged = result.get("flaggedResources") or []
         for r in flagged:
             st_raw = (r.get("status") or "").lower().strip()
-            st_ko = STATUS_MAP.get(st_raw, "미확인")
-            rid = r.get("resourceId") or ""
-            region = r.get("region") or ""
-            meta_list = r.get("metadata") or []
+            rid = (r.get("resourceId") or "").strip()
             is_suppressed = bool(r.get("isSuppressed"))
 
-            # 카운팅
+            # 제외 카운트
             if is_suppressed:
                 excluded_count += 1
 
+            # 집계
             if st_raw == "error":
                 error_count += 1
             elif st_raw == "warning":
                 warn_count += 1
             elif st_raw == "ok":
                 ok_count += 1
-            else:
-                # not_available/none 등은 '미확인'으로 상세에는 남기되 숫자 집계는 제외
-                pass
 
-            detailed_rows.append(
-                {
-                    "Check ID": check_id,
-                    "리전": region,
-                    "리소스 ID": rid,
-                    "상태": st_ko,  # (경고/주의/정상/미확인)
-                    "제외 여부": "제외" if is_suppressed else "",
-                    "메타데이터": ", ".join(meta_list),  # 콘솔 상세 열 묶음
-                }
-            )
+            # 리소스ID 목록: 제외는 목록에 포함하지 않음, 빈 ID는 스킵
+            if (not is_suppressed) and rid:
+                if st_raw in ("ok", "warning", "error"):
+                    status_to_ids[st_raw].append(rid)
 
         next_token = resp.get("nextToken")
         if not next_token:
@@ -151,7 +141,28 @@ def fetch_check_result_with_details(
     # 최종 상태(요약) 한글 매핑
     overall = STATUS_MAP.get(result_status_raw, "미확인")
 
-    return error_count, warn_count, ok_count, excluded_count, overall, detailed_rows
+    return error_count, warn_count, ok_count, excluded_count, overall, status_to_ids
+
+def build_resource_value_cell(status_to_ids: Dict[str, List[str]]) -> str:
+    """
+    '리소스 값' 셀 문자열 구성:
+      정상 : id1, id2
+      주의 : id3
+      경고 : id4, id5
+    순서는 정상 → 주의 → 경고
+    해당 상태에 리소스가 없으면 줄 자체를 생략
+    """
+    lines: List[str] = []
+    order = [("ok", "좋음"), ("warning", "보통"), ("error", "나쁨")]
+    for key, label in order:
+        ids = status_to_ids.get(key, [])
+        if not ids:
+            continue
+        # 중복 제거(안정적 표시를 위해 순서 유지)
+        seen = set()
+        uniq = [x for x in ids if not (x in seen or seen.add(x))]
+        lines.append(f"{label} : {', '.join(uniq)}")
+    return "\n".join(lines)
 
 def main():
     support = session.client("support", region_name=SUPPORT_REGION)
@@ -182,92 +193,61 @@ def main():
         Path(OUTPUT_XLSX).unlink(missing_ok=True)
         return
 
-    summary_rows = []
-    all_detail_rows: List[dict] = []
-
+    rows = []
     for c in checks:
         check_id = c.get("id")
         name = c.get("name") or ""
         category = pretty_pillar_name(c.get("category"))
-        description = c.get("description") or ""
-        metadata = ", ".join(c.get("metadata") or [])
+        description = (c.get("description") or "").strip()
 
-        # 체크 결과(집계 + 상세)
+        # 체크 결과(집계 + 상태별 리소스ID)
         try:
-            error_cnt, warn_cnt, ok_cnt, excl_cnt, overall, detail_rows = (
-                fetch_check_result_with_details(support, check_id)
+            error_cnt, warn_cnt, ok_cnt, excl_cnt, overall, status_to_ids = (
+                fetch_check_result_summary_and_ids(support, check_id)
             )
         except botocore.exceptions.ClientError as e:
-            # 개별 체크 실패 시에도 전체는 계속
             sys.stderr.write(f"[경고] 체크 결과 조회 실패 ({check_id}, {name}): {e}\n")
             error_cnt = warn_cnt = ok_cnt = excl_cnt = 0
             overall = "미확인"
-            detail_rows = []
+            status_to_ids = {}
 
-        # 요약 행
-        summary_rows.append(
+        resource_value = build_resource_value_cell(status_to_ids)
+
+        rows.append(
             {
                 "Check ID": check_id,
                 "Name": name,
                 "Category": category,
                 "Description": description,
-                "Metadata": metadata,
                 "경고(조치 권고)": error_cnt,
                 "주의(조사 권고)": warn_cnt,
                 "정상(발견된 문제 없음)": ok_cnt,
                 "제외": excl_cnt,
                 "최종 상태": overall,
+                "리소스 값": resource_value,  # ← 요구사항 반영
             }
         )
 
-        # 상세 행 + 체크 기본정보 일부 추가해도 좋다면 아래 주석 해제
-        for r in detail_rows:
-            r_with_name = {
-                "Check ID": r["Check ID"],
-                "Check Name": name,
-                "Category": category,
-                **{k: v for k, v in r.items() if k != "Check ID"},
-            }
-            all_detail_rows.append(r_with_name)
+    # 단일 시트(All) + Category/Name 정렬
+    df_all = pd.DataFrame(rows).sort_values(["Category", "Name"], ignore_index=True)
 
-    # DataFrame 구성
-    df_summary = pd.DataFrame(summary_rows).sort_values(
-        ["Category", "Name"], ignore_index=True
-    )
-    df_detail = pd.DataFrame(all_detail_rows)
-
-    # 엑셀 저장 (All + Pillar별 + Details)
+    # 엑셀 저장 (시트 1개: All) + '리소스 값' 줄바꿈 표시
     with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as xw:
-        # 전체 요약
-        df_summary.to_excel(xw, index=False, sheet_name="All")
+        df_all.to_excel(xw, index=False, sheet_name="All")
 
-        # Pillar별 요약
-        for category_name in df_summary["Category"].dropna().unique():
-            sheet = category_name[:31]  # 엑셀 시트 이름 31자 제한
-            df_summary[df_summary["Category"] == category_name].reset_index(drop=True)\
-                .to_excel(xw, index=False, sheet_name=sheet)
+        ws = xw.sheets["All"]
+        # '리소스 값' 열 wrap-text 적용 및 약간의 열 너비 조정
+        if "리소스 값" in df_all.columns:
+            col_idx = df_all.columns.get_loc("리소스 값") + 1  # 1-based
+            col_letter = get_column_letter(col_idx)
+            ws.column_dimensions[col_letter].width = 60  # 가독성 위해 넓게
+            for row in range(2, ws.max_row + 1):  # 헤더 제외
+                cell = ws.cell(row=row, column=col_idx)
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
 
-        # 리소스 상세
-        if not df_detail.empty:
-            # 열 순서 가독성
-            desired_cols = [
-                "Check ID", "Check Name", "Category",
-                "리전", "리소스 ID", "상태", "제외 여부", "메타데이터"
-            ]
-            existing_cols = [c for c in desired_cols if c in df_detail.columns]
-            remaining = [c for c in df_detail.columns if c not in existing_cols]
-            df_detail[existing_cols + remaining].to_excel(
-                xw, index=False, sheet_name="Details"
-            )
-        else:
-            # 상세가 하나도 없을 수 있으므로 빈 시트라도 생성
-            pd.DataFrame(
-                columns=["Check ID", "Check Name", "Category", "리전", "리소스 ID", "상태", "제외 여부", "메타데이터"]
-            ).to_excel(xw, index=False, sheet_name="Details")
-
-    print(f"완료: {OUTPUT_XLSX} 생성 (All + Pillar별 + Details 시트)")
-    print(" - All: 체크별 요약 (경고/주의/정상/제외/최종 상태)")
-    print(" - Details: 리소스별 상세(리전/리소스ID/상태/제외여부/메타데이터)")
+    print(f"완료: {OUTPUT_XLSX} 생성 (All 시트)")
+    print(" - Category 순 정렬, '리소스 값' 컬럼 포함")
+    print(" - '리소스 값'에는 제외 리소스는 포함되지 않습니다.")
 
 if __name__ == "__main__":
     main()
