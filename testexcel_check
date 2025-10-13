@@ -1,233 +1,272 @@
-#!/usr/bin/env python3.133
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
-Trusted Advisor 체크 목록을 엑셀로 추출하면서 'Name'을 한국어로 병기
-- 시트: All + Pillar별
-- 컬럼: Check ID, Name (KO), Name (EN), Category, Description, Metadata
-- 한국어 이름 생성 우선순위:
-  1) 체크ID 기반 수동 오버라이드(하드코딩 + 옵션 CSV)
-  2) 로컬 용어 사전/규칙 치환
-  3) Amazon Translate (옵션: USE_AWS_TRANSLATE=1)
-사전 준비:
-  pip install boto3 pandas openpyxl
-필수:
-  - Support API는 us-east-1에서만 호출
-  - Business/Enterprise/On-Ramp 지원 플랜
+Trusted Advisor 체크 메타 + 결과 요약(경고/주의/정상/제외) + 리소스 상세(인스턴스ID 등) 엑셀로 출력
+- All 시트: 전체 요약
+- Pillar별 시트: 카테고리별 요약
+- Details 시트: 리소스별 상세(리전, 리소스ID, 상태, 메타데이터, 제외여부)
 """
 
-import os
 import sys
-import csv
-from typing import Dict, List
+import time
+from typing import Dict, List, Tuple
 from pathlib import Path
 import boto3
 import botocore
 import pandas as pd
 
-# ===== 설정 =====
-OUTPUT_XLSX = "trusted_advisor_checks_ko.xlsx"
-LANGUAGE = "en"                 # TA API는 'en' 또는 'ja'만 허용
-SUPPORT_REGION = "us-east-1"    # Support/TA API 리전 고정
-TRANSLATE_REGION = "ap-northeast-2"  # Translate 리전(옵션)
-OVERRIDE_CSV = "ta_name_ko_overrides.csv"  # (선택) check_id,name_ko CSV
+OUTPUT_XLSX = "trusted_advisor_checks.xlsx"
 
-# ===== 하드코딩 자격증명 (테스트용; 운영/커밋 금지) =====
-AWS_ACCESS_KEY_ID="본인 ACCESS_KEY"
-AWS_SECRET_ACCESS_KEY="본인 SECRET ACCESS KEY"
-AWS_SESSION_TOKEN = None  # STS 임시자격이면 토큰 문자열 입력, 아니면 None
+# ✔ 언어: en 또는 ja 만 허용
+LANGUAGE = "en"
 
-# ===== 글로벌 세션(여기서 만든 세션만 사용) =====
+# ✔ TA/SUPPORT API는 us-east-1 고정
+SUPPORT_REGION = "us-east-1"
+
+# ✔ (예시) 명시적 자격 (하드코딩 권장X: 환경변수/프로파일 사용 권장)
+#    실제 운영에서는 환경변수(AWS_PROFILE, AWS_ACCESS_KEY_ID 등) 또는 SSO/Role 사용 권장
 session = boto3.Session(
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-    aws_session_token=AWS_SESSION_TOKEN,
-    region_name=SUPPORT_REGION,
+    aws_access_key_id="계정 Access Key",
+    aws_secret_access_key="계정 Secret Key",
+    region_name=SUPPORT_REGION,  # 세션의 기본 리전도 맞춰둠
 )
 
-# ===== Pillar 이름 매핑 =====
+# 콘솔 Pillar명 보기 좋게 매핑
+PRETTY_PILLAR: Dict[str, str] = {
+    "cost_optimizing": "Cost Optimization",
+    "cost_optimization": "Cost Optimization",
+    "performance": "Performance",
+    "security": "Security",
+    "fault_tolerance": "Fault Tolerance",
+    "operational_excellence": "Operational Excellence",
+    "service_limits": "Service Limits",
+    "service_quotas": "Service Limits",
+}
+
+# TA status → 한글 표기(요청한 치환)
+# - error   → 경고(=조치 권고)
+# - warning → 주의(=조사 권고)
+# - ok      → 정상(=발견된 문제 없음)
+STATUS_MAP = {
+    "error": "경고",
+    "warning": "주의",
+    "ok": "정상",
+    # not_available/none/'' 등은 '미확인' 처리
+}
+
 def pretty_pillar_name(raw: str) -> str:
     if not raw:
         return "Unknown"
     raw_lc = raw.strip().lower()
-    mapping = {
-        "cost_optimizing": "Cost Optimization",
-        "cost_optimization": "Cost Optimization",
-        "performance": "Performance",
-        "security": "Security",
-        "fault_tolerance": "Fault Tolerance",
-        "operational_excellence": "Operational Excellence",
-        "service_limits": "Service Limits",
-        "service_quotas": "Service Limits",
-    }
-    return mapping.get(raw_lc, raw_lc.replace("_", " ").title())
+    return PRETTY_PILLAR.get(raw_lc, raw_lc.replace("_", " ").title())
 
-# ===== 한글명 오버라이드(체크ID 기준; 콘솔 표기 맞추고 싶은 항목 추가) =====
-CHECK_ID_KO_OVERRIDES: Dict[str, str] = {
-    # 예) "abcd1234": "S3 미완료 멀티파트 업로드 중단 구성",
-}
+def backoff_sleep(i: int):
+    """간단한 지수 백오프 (최대 10초)"""
+    time.sleep(min(2 ** i, 10))
 
-# ===== 용어 사전(영→한) + 간단 규칙 =====
-GLOSSARY = [
-    ("Amazon S3", "Amazon S3"),
-    ("S3 ", "S3 "),
-    ("EC2", "EC2"),
-    ("RDS", "RDS"),
-    ("EBS", "EBS"),
-    ("ELB", "ELB"),
-    ("Auto Scaling", "Auto Scaling"),
-    ("Trusted Advisor", "Trusted Advisor"),
-    ("Cost Optimization", "비용 최적화"),
-    ("Performance", "성능"),
-    ("Security", "보안"),
-    ("Fault Tolerance", "장애 허용"),
-    ("Operational Excellence", "운영 우수성"),
-    # 일반 용어
-    ("Incomplete Multipart Upload", "미완료 멀티파트 업로드"),
-    ("Multipart Upload", "멀티파트 업로드"),
-    ("Abort Configuration", "중단 구성"),
-    ("Abort", "중단"),
-    ("Public Access", "퍼블릭 액세스"),
-    ("Publicly Accessible", "퍼블릭 액세스 가능"),
-    ("Encryption", "암호화"),
-    ("Unencrypted", "비암호화"),
-    ("Backup", "백업"),
-    ("Snapshot", "스냅샷"),
-    ("Provisioned", "프로비저닝된"),
-    ("Underutilized", "저활용"),
-    ("Idle", "유휴"),
-    ("Utilization", "활용도"),
-    ("Reserved Instances", "예약 인스턴스"),
-    ("Savings Plans", "세이빙스 플랜"),
-    ("Limits", "제한"),
-    ("Quotas", "할당량"),
-    ("Region", "리전"),
-    ("Availability Zone", "가용 영역"),
-    ("Best Practices", "모범 사례"),
-    ("Configuration", "구성"),
-    ("Security Group", "보안 그룹"),
-    ("Open Ports", "열린 포트"),
-    ("IAM", "IAM"),
-    ("Root Account", "루트 계정"),
-    ("MFA", "MFA"),
-    ("Logging", "로깅"),
-    ("Monitoring", "모니터링"),
-]
+def fetch_check_result_with_details(
+    support, check_id: str
+) -> Tuple[int, int, int, int, str, List[dict]]:
+    """
+    각 체크에 대해:
+      - 경고(error), 주의(warning), 정상(ok), 제외(isSuppressed=True) 카운트 집계
+      - 체크 전체 상태(요약) → 한글로 매핑(경고/주의/정상/미확인)
+      - 리소스 상세(리전, 리소스ID, 상태, 메타데이터, 제외여부) 리스트 반환
 
-def apply_glossary(en_name: str) -> str:
-    ko = en_name
-    for src, dst in GLOSSARY:
-        ko = ko.replace(src, dst)
-    ko = ko.replace(" - ", " - ").replace("  ", " ").strip()
-    return ko
+    Returns:
+        (error_cnt, warn_cnt, ok_cnt, excluded_cnt, overall_ko, detailed_rows)
+    """
+    warn_count = 0
+    error_count = 0
+    ok_count = 0
+    excluded_count = 0
 
-def load_csv_overrides(path: str) -> Dict[str, str]:
-    d: Dict[str, str] = {}
-    p = Path(path)
-    if not p.exists():
-        return d
-    with p.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        # 기대 컬럼: check_id,name_ko
-        for row in reader:
-            cid = (row.get("check_id") or "").strip()
-            name_ko = (row.get("name_ko") or "").strip()
-            if cid and name_ko:
-                d[cid] = name_ko
-    return d
+    next_token = None
+    result_status_raw = None
+    detailed_rows: List[dict] = []
 
-def translate_ko_fallback(sess: boto3.Session, text: str) -> str:
-    """USE_AWS_TRANSLATE=1 이면 Amazon Translate로 보정(옵션)."""
-    if os.getenv("USE_AWS_TRANSLATE", "0") != "1":
-        return text
-    try:
-        tr = sess.client("translate", region_name=TRANSLATE_REGION)
-        res = tr.translate_text(Text=text, SourceLanguageCode="en", TargetLanguageCode="ko")
-        return res.get("TranslatedText") or text
-    except Exception:
-        return text
+    # 페이지네이션 처리
+    while True:
+        for attempt in range(6):
+            try:
+                kwargs = {"checkId": check_id, "language": LANGUAGE}
+                if next_token:
+                    kwargs["nextToken"] = next_token
+                resp = support.describe_trusted_advisor_check_result(**kwargs)
+                break
+            except botocore.exceptions.ClientError as e:
+                code = e.response.get("Error", {}).get("Code", "")
+                if code in {"ThrottlingException", "TooManyRequestsException"}:
+                    backoff_sleep(attempt)
+                    continue
+                raise
 
-def get_ko_name(sess: boto3.Session, check_id: str, name_en: str,
-                csv_override: Dict[str, str]) -> str:
-    # 1) CSV/하드코딩 오버라이드(체크ID 기준)
-    if check_id in csv_override:
-        return csv_override[check_id]
-    if check_id in CHECK_ID_KO_OVERRIDES:
-        return CHECK_ID_KO_OVERRIDES[check_id]
-    # 2) 용어 사전 치환
-    ko_rule = apply_glossary(name_en)
-    # 3) 여전히 어색하면 Translate로 보정(옵션)
-    if ko_rule == name_en or any(w in ko_rule for w in ["Upload", "Configuration", "Unencrypted", "Limits"]):
-        return translate_ko_fallback(sess, ko_rule)
-    return ko_rule
+        result = resp.get("result", {}) or {}
+
+        # 전체 체크 상태(요약) 원본
+        if result_status_raw is None:
+            result_status_raw = (result.get("status") or "").lower().strip() or "not_available"
+
+        # 리소스 상세
+        flagged = result.get("flaggedResources") or []
+        for r in flagged:
+            st_raw = (r.get("status") or "").lower().strip()
+            st_ko = STATUS_MAP.get(st_raw, "미확인")
+            rid = r.get("resourceId") or ""
+            region = r.get("region") or ""
+            meta_list = r.get("metadata") or []
+            is_suppressed = bool(r.get("isSuppressed"))
+
+            # 카운팅
+            if is_suppressed:
+                excluded_count += 1
+
+            if st_raw == "error":
+                error_count += 1
+            elif st_raw == "warning":
+                warn_count += 1
+            elif st_raw == "ok":
+                ok_count += 1
+            else:
+                # not_available/none 등은 '미확인'으로 상세에는 남기되 숫자 집계는 제외
+                pass
+
+            detailed_rows.append(
+                {
+                    "Check ID": check_id,
+                    "리전": region,
+                    "리소스 ID": rid,
+                    "상태": st_ko,  # (경고/주의/정상/미확인)
+                    "제외 여부": "제외" if is_suppressed else "",
+                    "메타데이터": ", ".join(meta_list),  # 콘솔 상세 열 묶음
+                }
+            )
+
+        next_token = resp.get("nextToken")
+        if not next_token:
+            break
+
+    # 최종 상태(요약) 한글 매핑
+    overall = STATUS_MAP.get(result_status_raw, "미확인")
+
+    return error_count, warn_count, ok_count, excluded_count, overall, detailed_rows
 
 def main():
-    # === STS로 자격증명 즉시 검증 ===
-    try:
-        sts = session.client("sts", region_name=SUPPORT_REGION)
-        ident = sts.get_caller_identity()
-        print(f"[INFO] Caller: {ident.get('Arn')}")
-    except botocore.exceptions.NoCredentialsError:
-        sys.stderr.write("[에러] AWS 자격 증명을 찾을 수 없습니다. (키/토큰 확인)\n")
-        sys.exit(1)
-    except botocore.exceptions.ClientError as e:
-        sys.stderr.write(f"[에러] STS 호출 실패: {e}\n")
-        sys.exit(1)
-
     support = session.client("support", region_name=SUPPORT_REGION)
 
-    # === TA 체크 목록 조회 ===
+    # 체크 메타데이터 조회
     try:
         resp = support.describe_trusted_advisor_checks(language=LANGUAGE)
     except botocore.exceptions.ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
         if code in {"SubscriptionRequiredException", "AccessDeniedException"}:
             sys.stderr.write(
-                "[에러] Trusted Advisor API 권한/지원 플랜 필요 "
-                "(Business/Enterprise/On-Ramp).\n"
+                "[에러] Trusted Advisor API 사용 권한/지원 플랜 부족.\n"
+                " - Business/Enterprise/On-Ramp 지원 플랜 필요\n"
+                " - 또는 aws-support 관련 권한 필요\n"
             )
         elif code == "UnhandledValidationException":
-            sys.stderr.write("[에러] language는 'en' 또는 'ja'만 허용됩니다.\n")
+            sys.stderr.write("[에러] language 값은 'en' 또는 'ja'만 허용됩니다.\n")
         else:
-            sys.stderr.write(f"[에러] Support API 호출 실패: {code}: {e}\n")
+            sys.stderr.write(f"[에러] API 호출 실패: {code}: {e}\n")
+        sys.exit(1)
+    except botocore.exceptions.NoCredentialsError:
+        sys.stderr.write("[에러] 자격 증명을 찾을 수 없습니다.\n")
         sys.exit(1)
 
-    checks: List[dict] = resp.get("checks", [])
+    checks: List[dict] = resp.get("checks", []) or []
     if not checks:
         print("가져올 Trusted Advisor 체크가 없습니다.")
         Path(OUTPUT_XLSX).unlink(missing_ok=True)
         return
 
-    # === 한국어 이름 적용 ===
-    csv_override = load_csv_overrides(OVERRIDE_CSV)
-    rows = []
+    summary_rows = []
+    all_detail_rows: List[dict] = []
+
     for c in checks:
-        cid = c.get("id")
-        name_en = c.get("name") or ""
-        name_ko = get_ko_name(session, cid, name_en, csv_override)
-        rows.append({
-            "Check ID": cid,
-            "Name (KO)": name_ko,
-            "Name (EN)": name_en,
-            "Category": pretty_pillar_name(c.get("category")),
-            "Description": c.get("description"),
-            "Metadata": ", ".join(c.get("metadata") or []),
-        })
+        check_id = c.get("id")
+        name = c.get("name") or ""
+        category = pretty_pillar_name(c.get("category"))
+        description = c.get("description") or ""
+        metadata = ", ".join(c.get("metadata") or [])
 
-    df_all = pd.DataFrame(rows).sort_values(["Category", "Name (KO)"], ignore_index=True)
+        # 체크 결과(집계 + 상세)
+        try:
+            error_cnt, warn_cnt, ok_cnt, excl_cnt, overall, detail_rows = (
+                fetch_check_result_with_details(support, check_id)
+            )
+        except botocore.exceptions.ClientError as e:
+            # 개별 체크 실패 시에도 전체는 계속
+            sys.stderr.write(f"[경고] 체크 결과 조회 실패 ({check_id}, {name}): {e}\n")
+            error_cnt = warn_cnt = ok_cnt = excl_cnt = 0
+            overall = "미확인"
+            detail_rows = []
 
-    # === 엑셀 저장 ===
+        # 요약 행
+        summary_rows.append(
+            {
+                "Check ID": check_id,
+                "Name": name,
+                "Category": category,
+                "Description": description,
+                "Metadata": metadata,
+                "경고(조치 권고)": error_cnt,
+                "주의(조사 권고)": warn_cnt,
+                "정상(발견된 문제 없음)": ok_cnt,
+                "제외": excl_cnt,
+                "최종 상태": overall,
+            }
+        )
+
+        # 상세 행 + 체크 기본정보 일부 추가해도 좋다면 아래 주석 해제
+        for r in detail_rows:
+            r_with_name = {
+                "Check ID": r["Check ID"],
+                "Check Name": name,
+                "Category": category,
+                **{k: v for k, v in r.items() if k != "Check ID"},
+            }
+            all_detail_rows.append(r_with_name)
+
+    # DataFrame 구성
+    df_summary = pd.DataFrame(summary_rows).sort_values(
+        ["Category", "Name"], ignore_index=True
+    )
+    df_detail = pd.DataFrame(all_detail_rows)
+
+    # 엑셀 저장 (All + Pillar별 + Details)
     with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as xw:
-        df_all.to_excel(xw, index=False, sheet_name="All")
-        for category in df_all["Category"].dropna().unique():
-            sheet_name = category[:31]
-            df_all[df_all["Category"] == category].reset_index(drop=True)\
-                .to_excel(xw, index=False, sheet_name=sheet_name)
+        # 전체 요약
+        df_summary.to_excel(xw, index=False, sheet_name="All")
 
-    print(f"완료: {OUTPUT_XLSX} 생성 (All + Pillar별 시트, 한국어 이름 포함)")
-    print("오버라이드: ta_name_ko_overrides.csv (check_id,name_ko)로 추가 가능")
-    if os.getenv("USE_AWS_TRANSLATE", "0") == "1":
-        print("참고: Amazon Translate 사용함 (USE_AWS_TRANSLATE=1).")
+        # Pillar별 요약
+        for category_name in df_summary["Category"].dropna().unique():
+            sheet = category_name[:31]  # 엑셀 시트 이름 31자 제한
+            df_summary[df_summary["Category"] == category_name].reset_index(drop=True)\
+                .to_excel(xw, index=False, sheet_name=sheet)
+
+        # 리소스 상세
+        if not df_detail.empty:
+            # 열 순서 가독성
+            desired_cols = [
+                "Check ID", "Check Name", "Category",
+                "리전", "리소스 ID", "상태", "제외 여부", "메타데이터"
+            ]
+            existing_cols = [c for c in desired_cols if c in df_detail.columns]
+            remaining = [c for c in df_detail.columns if c not in existing_cols]
+            df_detail[existing_cols + remaining].to_excel(
+                xw, index=False, sheet_name="Details"
+            )
+        else:
+            # 상세가 하나도 없을 수 있으므로 빈 시트라도 생성
+            pd.DataFrame(
+                columns=["Check ID", "Check Name", "Category", "리전", "리소스 ID", "상태", "제외 여부", "메타데이터"]
+            ).to_excel(xw, index=False, sheet_name="Details")
+
+    print(f"완료: {OUTPUT_XLSX} 생성 (All + Pillar별 + Details 시트)")
+    print(" - All: 체크별 요약 (경고/주의/정상/제외/최종 상태)")
+    print(" - Details: 리소스별 상세(리전/리소스ID/상태/제외여부/메타데이터)")
 
 if __name__ == "__main__":
     main()
