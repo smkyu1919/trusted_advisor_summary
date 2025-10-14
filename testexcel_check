@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#Github v1.4 (final)
 
 """
 Trusted Advisor 체크 결과를 단일 시트(All)로 출력
 - Category 순 정렬
 - 각 체크 행에 '리소스 값' 컬럼 추가:
-    '정상 : r1, r2\\n주의 : r3\\n경고 : r4, r5' 형식
-- 제외(isSuppressed=True)는 카운트만 '제외'에 반영하고 '리소스 값'에는 포함하지 않음
+    상태별 블록 + 리소스 단위 개행(쉼표 포함 분리)
+    예)
+      정상 :
+      id1
+      id2
+      주의 :
+      id3
+      경고 :
+      id4
+- '최종 상태' 컬럼은 요약 텍스트(좋음/보통/나쁨/미확인)만 표시
+- 제외(isSuppressed=True)는 카운트만 '제외'에 반영하고
+  '리소스 값' 상세 목록에는 포함하지 않음
 """
 
 import sys
@@ -30,8 +39,7 @@ LANGUAGE = "en"
 # ✔ TA/SUPPORT API는 us-east-1 고정
 SUPPORT_REGION = "us-east-1"
 
-# ✔ (예시) 명시적 자격 (하드코딩 권장X: 환경변수/프로파일 사용 권장)
-#    실제 운영에서는 환경변수/프로파일/SSO/AssumeRole 권장
+# ✔ 세션: 기본(프로파일/역할/환경변수) 사용 권장
 session = boto3.Session(
     aws_access_key_id="계정 Access Key",
     aws_secret_access_key="계정 Secret Key",
@@ -52,9 +60,9 @@ PRETTY_PILLAR: Dict[str, str] = {
 
 # TA status → 한글 표기(요청 치환)
 STATUS_MAP = {
-    "error": "나쁨",    # (= 조치 권고)
-    "warning": "보통",  # (= 조사 권고)
-    "ok": "좋음",       # (= 발견된 문제 없음)
+    "error": "경고",    # (= 조치 권고)
+    "warning": "주의",  # (= 조사 권고)
+    "ok": "정상",       # (= 발견된 문제 없음)
 }
 
 def pretty_pillar_name(raw: str) -> str:
@@ -145,23 +153,39 @@ def fetch_check_result_summary_and_ids(
 
 def build_resource_value_cell(status_to_ids: Dict[str, List[str]]) -> str:
     """
-    '리소스 값' 셀 문자열 구성:
-      정상 : id1, id2
-      주의 : id3
-      경고 : id4, id5
-    순서는 정상 → 주의 → 경고
-    해당 상태에 리소스가 없으면 줄 자체를 생략
+    '리소스 값' 셀 문자열 구성 (쉼표 및 리소스 단위 개행):
+      좋음 :
+      id1
+      id2
+      보통 :
+      id3
+      나쁨 :
+      id4
+      id5
+
+    - 상태 순서: 정상(좋음) → 주의(보통) → 경고(나쁨)
+    - 쉼표(,)가 포함된 항목은 쉼표로 분리해 개행
+    - 공백/빈 토큰 제거, 중복 제거(표시 순서 유지)
     """
+    def explode_ids(ids: List[str]) -> List[str]:
+        seen = set()
+        out: List[str] = []
+        for s in ids:
+            parts = [p.strip() for p in s.split(",")]  # 쉼표 기준 쪼개기
+            for p in parts:
+                if p and not (p in seen or seen.add(p)):
+                    out.append(p)
+        return out
+
     lines: List[str] = []
-    order = [("ok", "좋음"), ("warning", "보통"), ("error", "나쁨")]
+    order = [("ok", "정상"), ("warning", "주의"), ("error", "경고")]
     for key, label in order:
-        ids = status_to_ids.get(key, [])
+        raw_ids = status_to_ids.get(key, []) or []
+        ids = explode_ids(raw_ids)
         if not ids:
             continue
-        # 중복 제거(안정적 표시를 위해 순서 유지)
-        seen = set()
-        uniq = [x for x in ids if not (x in seen or seen.add(x))]
-        lines.append(f"{label} : {', '.join(uniq)}")
+        lines.append(f"{label} :")
+        lines.extend(ids)  # 각 리소스를 개행으로 추가
     return "\n".join(lines)
 
 def main():
@@ -211,7 +235,7 @@ def main():
             overall = "미확인"
             status_to_ids = {}
 
-        resource_value = build_resource_value_cell(status_to_ids)
+        resource_value = build_resource_value_cell(status_to_ids)  # ★ 쉼표 기준 개행 버전
 
         rows.append(
             {
@@ -223,8 +247,8 @@ def main():
                 "주의(조사 권고)": warn_cnt,
                 "정상(발견된 문제 없음)": ok_cnt,
                 "제외": excl_cnt,
-                "최종 상태": overall,
-                "리소스 값": resource_value,  # ← 요구사항 반영
+                "최종 상태": overall,          # ★ 요약 텍스트 유지
+                "리소스 값": resource_value,   # ★ 개행된 상세 텍스트
             }
         )
 
@@ -234,20 +258,29 @@ def main():
     # 엑셀 저장 (시트 1개: All) + '리소스 값' 줄바꿈 표시
     with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as xw:
         df_all.to_excel(xw, index=False, sheet_name="All")
-
         ws = xw.sheets["All"]
-        # '리소스 값' 열 wrap-text 적용 및 약간의 열 너비 조정
+
+        # 열 너비/줄바꿈
+        # - '리소스 값'은 개행 표시 필요 → wrap_text=True
+        # - '최종 상태'는 요약 텍스트 → 굳이 wrap 불필요 (너비만 살짝)
+        # - 필요 시 아래 width 값 조정
         if "리소스 값" in df_all.columns:
-            col_idx = df_all.columns.get_loc("리소스 값") + 1  # 1-based
+            col_idx = df_all.columns.get_loc("리소스 값") + 1
             col_letter = get_column_letter(col_idx)
-            ws.column_dimensions[col_letter].width = 60  # 가독성 위해 넓게
-            for row in range(2, ws.max_row + 1):  # 헤더 제외
+            ws.column_dimensions[col_letter].width = 60
+            for row in range(2, ws.max_row + 1):
                 cell = ws.cell(row=row, column=col_idx)
                 cell.alignment = Alignment(wrap_text=True, vertical="top")
 
+        if "최종 상태" in df_all.columns:
+            col_idx = df_all.columns.get_loc("최종 상태") + 1
+            col_letter = get_column_letter(col_idx)
+            ws.column_dimensions[col_letter].width = 18  # 읽기 좋은 정도
+
     print(f"완료: {OUTPUT_XLSX} 생성 (All 시트)")
-    print(" - Category 순 정렬, '리소스 값' 컬럼 포함")
-    print(" - '리소스 값'에는 제외 리소스는 포함되지 않습니다.")
+    print(" - Category 순 정렬")
+    print(" - '리소스 값'은 쉼표/리소스 단위 개행, '최종 상태'는 요약 텍스트")
+    print(" - '리소스 값'에는 제외 리소스가 포함되지 않습니다.")
 
 if __name__ == "__main__":
     main()
