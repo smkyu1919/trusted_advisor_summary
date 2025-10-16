@@ -4,23 +4,17 @@
 """
 Trusted Advisor 체크 결과를 단일 시트(All)로 출력
 - Category 순 정렬
-- 각 체크 행에 '리소스 값' 컬럼 추가:
-    상태별 블록 + 리소스 단위 개행(쉼표 포함 분리)
-    예)
-      정상 :
-      id1
-      id2
-      주의 :
-      id3
-      경고 :
-      id4
-- '최종 상태' 컬럼은 요약 텍스트(좋음/보통/나쁨/미확인)만 표시
-- 제외(isSuppressed=True)는 카운트만 '제외'에 반영하고
-  '리소스 값' 상세 목록에는 포함하지 않음
+- 각 체크 행에 '리소스 값' 컬럼 추가 (정상 블록은 출력하지 않음)
+- '최종 상태'는 정상/주의/경고/미확인 요약
+- 제외(isSuppressed=True)는 카운트만 반영
+- 신규: '소스 종류' 컬럼 (키워드 기반 추정)
 """
+#이 코드는 활성화된 엑세스키로만 사용 가능하며, Support Plan이 Developer는 지원불가(Trusted Advisor 사용불가)
+
 
 import sys
 import time
+import re
 from typing import Dict, List, Tuple, DefaultDict
 from collections import defaultdict
 from pathlib import Path
@@ -31,22 +25,19 @@ import pandas as pd
 from openpyxl.styles import Alignment
 from openpyxl.utils import get_column_letter
 
+VERSION = "rv5b-2025-10-16"
 OUTPUT_XLSX = "trusted_advisor_checks.xlsx"
 
-# ✔ 언어: en 또는 ja 만 허용
-LANGUAGE = "en"
+LANGUAGE = "en"              # en 또는 ja
+SUPPORT_REGION = "us-east-1" # TA API 고정
 
-# ✔ TA/SUPPORT API는 us-east-1 고정
-SUPPORT_REGION = "us-east-1"
-
-# ✔ 세션: 기본(프로파일/역할/환경변수) 사용 권장
+# ⚠️ 운영에서는 하드코드 자격증명 사용 지양
 session = boto3.Session(
-    aws_access_key_id="계정 Access Key",
-    aws_secret_access_key="계정 Secret Key",
-    region_name=SUPPORT_REGION,  # 세션의 기본 리전도 맞춰둠
+    aws_access_key_id="계정 Access KEy 활성화된 것이면 됨",
+    aws_secret_access_key="계정 Secret Access KEy 활성화된 것이면 됨",
+    region_name=SUPPORT_REGION,
 )
 
-# 콘솔 Pillar명 보기 좋게 매핑
 PRETTY_PILLAR: Dict[str, str] = {
     "cost_optimizing": "Cost Optimization",
     "cost_optimization": "Cost Optimization",
@@ -58,11 +49,10 @@ PRETTY_PILLAR: Dict[str, str] = {
     "service_quotas": "Service Limits",
 }
 
-# TA status → 한글 표기(요청 치환)
-STATUS_MAP = {
-    "error": "경고",    # (= 조치 권고)
-    "warning": "주의",  # (= 조사 권고)
-    "ok": "정상",       # (= 발견된 문제 없음)
+STATUS_MAP_FINAL = {
+    "error": "경고",
+    "warning": "주의",
+    "ok": "정상",
 }
 
 def pretty_pillar_name(raw: str) -> str:
@@ -72,21 +62,11 @@ def pretty_pillar_name(raw: str) -> str:
     return PRETTY_PILLAR.get(raw_lc, raw_lc.replace("_", " ").title())
 
 def backoff_sleep(i: int):
-    """간단한 지수 백오프 (최대 10초)"""
     time.sleep(min(2 ** i, 10))
 
 def fetch_check_result_summary_and_ids(
     support, check_id: str
 ) -> Tuple[int, int, int, int, str, Dict[str, List[str]]]:
-    """
-    각 체크에 대해:
-      - 경고(error), 주의(warning), 정상(ok), 제외(isSuppressed=True) 카운트 집계
-      - 체크 전체 상태(요약) → 한글 매핑(경고/주의/정상/미확인)
-      - 상태별 리소스ID 목록(정상/주의/경고) 반환 (제외는 목록에 포함하지 않음)
-
-    Returns:
-        (error_cnt, warn_cnt, ok_cnt, excluded_cnt, overall_ko, status_to_ids)
-    """
     warn_count = 0
     error_count = 0
     ok_count = 0
@@ -97,7 +77,6 @@ def fetch_check_result_summary_and_ids(
     status_to_ids: DefaultDict[str, List[str]] = defaultdict(list)
 
     while True:
-        # 페이지네이션 + 스로틀링 대비
         for attempt in range(6):
             try:
                 kwargs = {"checkId": check_id, "language": LANGUAGE}
@@ -114,22 +93,18 @@ def fetch_check_result_summary_and_ids(
 
         result = resp.get("result", {}) or {}
 
-        # 전체 체크 상태(요약) 원본
         if result_status_raw is None:
             result_status_raw = (result.get("status") or "").lower().strip() or "not_available"
 
-        # 리소스 상세
         flagged = result.get("flaggedResources") or []
         for r in flagged:
             st_raw = (r.get("status") or "").lower().strip()
             rid = (r.get("resourceId") or "").strip()
             is_suppressed = bool(r.get("isSuppressed"))
 
-            # 제외 카운트
             if is_suppressed:
                 excluded_count += 1
 
-            # 집계
             if st_raw == "error":
                 error_count += 1
             elif st_raw == "warning":
@@ -137,7 +112,6 @@ def fetch_check_result_summary_and_ids(
             elif st_raw == "ok":
                 ok_count += 1
 
-            # 리소스ID 목록: 제외는 목록에 포함하지 않음, 빈 ID는 스킵
             if (not is_suppressed) and rid:
                 if st_raw in ("ok", "warning", "error"):
                     status_to_ids[st_raw].append(rid)
@@ -146,54 +120,73 @@ def fetch_check_result_summary_and_ids(
         if not next_token:
             break
 
-    # 최종 상태(요약) 한글 매핑
-    overall = STATUS_MAP.get(result_status_raw, "미확인")
-
+    overall = STATUS_MAP_FINAL.get(result_status_raw, "미확인")
     return error_count, warn_count, ok_count, excluded_count, overall, status_to_ids
 
+def split_on_commas(s: str) -> List[str]:
+    if not s:
+        return []
+    s = s.replace("，", ",").replace("\u00A0", " ")
+    s = s.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    parts = re.split(r",\s*", s)
+    return [p.strip() for p in parts if p and p.strip()]
+
+def explode_ids(ids: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for s in ids:
+        for tok in split_on_commas(s):
+            if tok not in seen:
+                seen.add(tok)
+                out.append(tok)
+    return out
+
 def build_resource_value_cell(status_to_ids: Dict[str, List[str]]) -> str:
-    """
-    '리소스 값' 셀 문자열 구성 (쉼표 및 리소스 단위 개행):
-      좋음 :
-      id1
-      id2
-      보통 :
-      id3
-      나쁨 :
-      id4
-      id5
-
-    - 상태 순서: 정상(좋음) → 주의(보통) → 경고(나쁨)
-    - 쉼표(,)가 포함된 항목은 쉼표로 분리해 개행
-    - 공백/빈 토큰 제거, 중복 제거(표시 순서 유지)
-    """
-    def explode_ids(ids: List[str]) -> List[str]:
-        seen = set()
-        out: List[str] = []
-        for s in ids:
-            parts = [p.strip() for p in s.split(",")]  # 쉼표 기준 쪼개기
-            for p in parts:
-                if p and not (p in seen or seen.add(p)):
-                    out.append(p)
-        return out
-
     lines: List[str] = []
-    order = [("ok", "정상"), ("warning", "주의"), ("error", "경고")]
+    order = [("warning", "주의"), ("error", "경고")]  # 정상(ok)은 출력 제외
     for key, label in order:
         raw_ids = status_to_ids.get(key, []) or []
         ids = explode_ids(raw_ids)
         if not ids:
             continue
         lines.append(f"{label} :")
-        lines.extend(ids)  # 각 리소스를 개행으로 추가
+        lines.extend(ids)
     return "\n".join(lines)
 
+# ── 소스 종류 판별 (안전한 정규식) ──
+SOURCE_RULES = [
+    (re.compile(r"cost\s*optimization\s*hub", re.I), "AWS Cost Optimization Hub"),
+    (re.compile(r"(?:compute|computer)\s*optimizer", re.I), "AWS Compute Optimizer"),
+    (re.compile(r"\bconfig\b|aws\s*config|config\s*rule", re.I), "AWS Config"),
+    (re.compile(r"well[-\s]?architected", re.I), "Well Architected 리뷰"),
+    (re.compile(r"security\s*hub", re.I), "AWS Security hub"),
+    (re.compile(r"resilience\s*hub", re.I), "AWS Resilience hub"),
+    (re.compile(r"\brds\b|amazon\s*rds", re.I), "Amazon RDS"),
+]
+
+def detect_source(name: str, description: str, category: str) -> str:
+    blob = " ".join([(name or ""), (description or ""), (category or "")])
+    for pat, label in SOURCE_RULES:
+        if pat.search(blob):
+            return label
+    return "AWS Trusted Advisor"
+
 def main():
+    print(f"[INFO] Running file : {__file__}")
+    print(f"[INFO] Script ver  : {VERSION}")
+
     support = session.client("support", region_name=SUPPORT_REGION)
 
-    # 체크 메타데이터 조회
+    # 체크 메타데이터 조회 (+ 빈 목록 방지용 재시도/로그)
     try:
         resp = support.describe_trusted_advisor_checks(language=LANGUAGE)
+        checks: List[dict] = resp.get("checks", []) or []
+        print(f"[DEBUG] checks(en): {len(checks)}")
+        if not checks and LANGUAGE.lower() != "ja":
+            print("[WARN] No checks with LANGUAGE='en'. Retrying with LANGUAGE='ja' ...")
+            resp = support.describe_trusted_advisor_checks(language="ja")
+            checks = resp.get("checks", []) or []
+            print(f"[DEBUG] checks(ja): {len(checks)}")
     except botocore.exceptions.ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
         if code in {"SubscriptionRequiredException", "AccessDeniedException"}:
@@ -211,20 +204,33 @@ def main():
         sys.stderr.write("[에러] 자격 증명을 찾을 수 없습니다.\n")
         sys.exit(1)
 
-    checks: List[dict] = resp.get("checks", []) or []
+    # 비어 있어도 "헤더만 있는 엑셀"을 생성하고 계속 진행
     if not checks:
-        print("가져올 Trusted Advisor 체크가 없습니다.")
-        Path(OUTPUT_XLSX).unlink(missing_ok=True)
+        print("가져올 Trusted Advisor 체크가 없습니다. (헤더만 생성)")
+        df_all = pd.DataFrame(columns=[
+            "Check ID","Name","Category","Description",
+            "경고(조치 권고)","주의(조사 권고)","정상(문제 없음)","제외",
+            "최종 상태","리소스 값","소스 종류"
+        ])
+        with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as xw:
+            df_all.to_excel(xw, index=False, sheet_name="All")
+            ws = xw.sheets["All"]
+            for col_name, width in [("리소스 값", 60), ("최종 상태", 14), ("소스 종류", 28)]:
+                if col_name in df_all.columns:
+                    idx = df_all.columns.get_loc(col_name) + 1
+                    ws.column_dimensions[get_column_letter(idx)].width = width
+        print(f"완료: {OUTPUT_XLSX} (빈 결과, 헤더만)")
         return
 
     rows = []
+    sample_preview = None
+
     for c in checks:
         check_id = c.get("id")
         name = c.get("name") or ""
         category = pretty_pillar_name(c.get("category"))
         description = (c.get("description") or "").strip()
 
-        # 체크 결과(집계 + 상태별 리소스ID)
         try:
             error_cnt, warn_cnt, ok_cnt, excl_cnt, overall, status_to_ids = (
                 fetch_check_result_summary_and_ids(support, check_id)
@@ -235,7 +241,11 @@ def main():
             overall = "미확인"
             status_to_ids = {}
 
-        resource_value = build_resource_value_cell(status_to_ids)  # ★ 쉼표 기준 개행 버전
+        resource_value = build_resource_value_cell(status_to_ids)
+        source_type = detect_source(name=name, description=description, category=category)
+
+        if not sample_preview and resource_value:
+            sample_preview = resource_value.replace("\n", "⏎")
 
         rows.append(
             {
@@ -245,42 +255,40 @@ def main():
                 "Description": description,
                 "경고(조치 권고)": error_cnt,
                 "주의(조사 권고)": warn_cnt,
-                "정상(발견된 문제 없음)": ok_cnt,
+                "정상(문제 없음)": ok_cnt,
                 "제외": excl_cnt,
-                "최종 상태": overall,          # ★ 요약 텍스트 유지
-                "리소스 값": resource_value,   # ★ 개행된 상세 텍스트
+                "최종 상태": overall,
+                "리소스 값": resource_value,
+                "소스 종류": source_type,
             }
         )
 
-    # 단일 시트(All) + Category/Name 정렬
     df_all = pd.DataFrame(rows).sort_values(["Category", "Name"], ignore_index=True)
 
-    # 엑셀 저장 (시트 1개: All) + '리소스 값' 줄바꿈 표시
     with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as xw:
         df_all.to_excel(xw, index=False, sheet_name="All")
         ws = xw.sheets["All"]
 
-        # 열 너비/줄바꿈
-        # - '리소스 값'은 개행 표시 필요 → wrap_text=True
-        # - '최종 상태'는 요약 텍스트 → 굳이 wrap 불필요 (너비만 살짝)
-        # - 필요 시 아래 width 값 조정
         if "리소스 값" in df_all.columns:
             col_idx = df_all.columns.get_loc("리소스 값") + 1
-            col_letter = get_column_letter(col_idx)
-            ws.column_dimensions[col_letter].width = 60
+            ws.column_dimensions[get_column_letter(col_idx)].width = 60
             for row in range(2, ws.max_row + 1):
                 cell = ws.cell(row=row, column=col_idx)
                 cell.alignment = Alignment(wrap_text=True, vertical="top")
 
         if "최종 상태" in df_all.columns:
             col_idx = df_all.columns.get_loc("최종 상태") + 1
-            col_letter = get_column_letter(col_idx)
-            ws.column_dimensions[col_letter].width = 18  # 읽기 좋은 정도
+            ws.column_dimensions[get_column_letter(col_idx)].width = 14
+
+        if "소스 종류" in df_all.columns:
+            col_idx = df_all.columns.get_loc("소스 종류") + 1
+            ws.column_dimensions[get_column_letter(col_idx)].width = 28
 
     print(f"완료: {OUTPUT_XLSX} 생성 (All 시트)")
-    print(" - Category 순 정렬")
-    print(" - '리소스 값'은 쉼표/리소스 단위 개행, '최종 상태'는 요약 텍스트")
-    print(" - '리소스 값'에는 제외 리소스가 포함되지 않습니다.")
+    if sample_preview:
+        print(f"[PREVIEW] 첫 번째 '리소스 값' (개행표시=⏎): {sample_preview}")
+    print(" - '리소스 값'은 주의/경고만 포함, 각 리소스는 1줄 1개")
+    print(" - '소스 종류' 컬럼 추가 (키워드 기반 추정, 미매칭은 AWS Trusted Advisor)")
 
 if __name__ == "__main__":
     main()
