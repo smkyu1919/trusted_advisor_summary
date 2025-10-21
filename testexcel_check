@@ -742,6 +742,8 @@ def fetch_check_result_summary(
             is_suppressed = bool(r.get("isSuppressed"))
             meta_vals = [ _s(v) for v in (r.get("metadata") or []) ]
 
+            _debug_print_meta_for_rds_backups(check_name, meta_headers, meta_vals, rid, st_raw)
+
             display_text = compose_display(check_name, meta_headers, meta_vals, rid)
 
             if is_suppressed:
