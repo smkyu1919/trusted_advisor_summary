@@ -7,17 +7,20 @@ Trusted Advisor 체크 결과를 단일 시트(All)로 출력
 - 각 체크 행에 '리소스 값' 컬럼 추가 (정상 블록은 출력하지 않음)
 - '최종 상태'는 정상/주의/경고/미확인 요약
 - 제외(isSuppressed=True)는 카운트만 반영
-- 신규: '소스 종류' 컬럼 (키워드 기반 추정)
-"""
-#이 코드는 활성화된 엑세스키로만 사용 가능하며, Support Plan이 Developer는 지원불가(Trusted Advisor 사용불가)
+- '소스 종류' 컬럼 (키워드 기반 추정)
 
+rv5m.4 (2025-10-21)
+- 2순위: Name 포함 탭을 meta_headers 순서로 스캔 후 사람친화 값 즉시 채택
+- 6순위: Service Limits/Quotas 전용 조립(Region | Service | Limit Amount | Current Usage | Status) 동의어 매핑 포함
+- 8순위: Recommended Resource Summary / Recommendation Summary 최후 보루
+- 기존 난수 토큰 차단, ARN 축약, Strong/Instance/Check/전체조합 로직은 유지
+"""
 
 import sys
 import time
 import re
 from typing import Dict, List, Tuple, DefaultDict
 from collections import defaultdict
-from pathlib import Path
 
 import boto3
 import botocore
@@ -25,16 +28,16 @@ import pandas as pd
 from openpyxl.styles import Alignment
 from openpyxl.utils import get_column_letter
 
-VERSION = "rv5b-2025-10-16"
+VERSION = "rv5m.4-2025-10-21"
 OUTPUT_XLSX = "trusted_advisor_checks.xlsx"
 
 LANGUAGE = "en"              # en 또는 ja
 SUPPORT_REGION = "us-east-1" # TA API 고정
 
-# ⚠️ 운영에서는 하드코드 자격증명 사용 지양
+# ⚠️ 운영에서는 하드코드 자격증명 사용 지양(요청 코드 유지)
 session = boto3.Session(
-    aws_access_key_id="계정 Access KEy 활성화된 것이면 됨",
-    aws_secret_access_key="계정 Secret Access KEy 활성화된 것이면 됨",
+    aws_access_key_id="개인 계정 세션키",
+    aws_secret_access_key="개인 계정 시크릿키",
     region_name=SUPPORT_REGION,
 )
 
@@ -49,11 +52,7 @@ PRETTY_PILLAR: Dict[str, str] = {
     "service_quotas": "Service Limits",
 }
 
-STATUS_MAP_FINAL = {
-    "error": "경고",
-    "warning": "주의",
-    "ok": "정상",
-}
+STATUS_MAP_FINAL = {"error": "경고", "warning": "주의", "ok": "정상"}
 
 def pretty_pillar_name(raw: str) -> str:
     if not raw:
@@ -64,8 +63,492 @@ def pretty_pillar_name(raw: str) -> str:
 def backoff_sleep(i: int):
     time.sleep(min(2 ** i, 10))
 
-def fetch_check_result_summary_and_ids(
-    support, check_id: str
+# ─────────────────────────────────────────────────────────────────────────────
+# 패턴/유틸
+# ─────────────────────────────────────────────────────────────────────────────
+ARN_RE = re.compile(r"^arn:(aws|aws-cn|aws-us-gov):([a-z0-9\-]+):([a-z0-9\-]*):(\d{12})?:(.+)$")
+LAMBDA_FN_ARN_RE = re.compile(r"arn:[^:]+:lambda:[^:]+:\d{12}:function[:/][A-Za-z0-9-_]+(?::[A-Za-z0-9\-\$._+]+)?")
+
+VOL_RE = re.compile(r"\bvol-[0-9a-fA-F]{8,}\b")
+I_RE   = re.compile(r"\bi-[0-9a-fA-F]{8,}\b")
+SG_RE  = re.compile(r"\bsg-[0-9a-fA-F]{8,}\b")
+ENI_RE = re.compile(r"\beni-[0-9a-fA-F]{8,}\b")
+SNAP_RE= re.compile(r"\bsnap-[0-9a-fA-F]{8,}\b")
+
+TG_PATH_RE  = re.compile(r"\btargetgroup/[A-Za-z0-9-]+/[0-9a-fA-F]{6,}\b")
+ALB_PATH_RE = re.compile(r"\bapp/[A-Za-z0-9-]+/[0-9a-fA-F]{6,}\b")
+NLB_PATH_RE = re.compile(r"\bnet/[A-Za-z0-9-]+/[0-9a-fA-F]{6,}\b")
+
+RDS_ARN_RE  = re.compile(r"arn:[^:]+:rds:[^:]+:\d{12}:(?:db|cluster):[A-Za-z0-9-]+")
+KMS_ARN_RE  = re.compile(r"arn:[^:]+:kms:[^:]+:\d{12}:(?:key|alias)/[A-Za-z0-9/_\-]+")
+IAM_ARN_RE  = re.compile(r"arn:[^:]+:iam::\d{12}:(?:role|user|group|policy)/[A-Za-z0-9+=,.@\-_/]+")
+
+DDB_ARN_RE  = re.compile(r"arn:[^:]+:dynamodb:[^:]+:\d{12}:table/[A-Za-z0-9_.\-]+")
+SNS_ARN_RE  = re.compile(r"arn:[^:]+:sns:[^:]+:\d{12}:[A-Za-z0-9_.\-]+")
+SQS_ARN_RE  = re.compile(r"arn:[^:]+:sqs:[^:]+:\d{12}:[A-Za-z0-9_.\-]+")
+ECR_ARN_RE  = re.compile(r"arn:[^:]+:ecr:[^:]+:\d{12}:repository/[A-Za-z0-9/_\-]+")
+EKS_ARN_RE  = re.compile(r"arn:[^:]+:eks:[^:]+:\d{12}:cluster/[A-Za-z0-9._\-]+")
+ECS_ARN_RE  = re.compile(r"arn:[^:]+:ecs:[^:]+:\d{12}:(?:service|cluster)/[A-Za-z0-9/_\-]+")
+CFN_DISTR_ID_RE = re.compile(r"\bE[A-Z0-9]{12}\b")
+
+ELASTICACHE_RE = re.compile(r"\b(arn:[^:]+:elasticache:[^:]+:\d{12}:.+|cache\.[a-z0-9\-]+|[A-Za-z0-9\-]*cache[A-Za-z0-9\-]*)\b")
+REDSHIFT_ARN_RE= re.compile(r"arn:[^:]+:redshift:[^:]+:\d{12}:(?:cluster|dbname):[A-Za-z0-9\-]+")
+
+OPENSEARCH_ARN_RE = re.compile(r"arn:[^:]+:(?:es|opensearch):[^:]+:\d{12}:domain/[A-Za-z0-9\-]+")
+ROUTE53_HOSTEDZONE_RE = re.compile(r"/hostedzone/[A-Z0-9]+")
+ROUTE53_ZONE_NAME_RE  = re.compile(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+BUCKETISH_RE = re.compile(r"^[a-z0-9][a-z0-9\.\-]{1,61}[a-z0-9]$")
+HUMAN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-\/]{2,200}$")
+NOISE_TOKEN_RE = re.compile(r"^[A-Za-z0-9\-_]{24,}$")
+
+REGION_RE = re.compile(
+    r"^(?:us|ap|eu|me|af|sa|ca)-(?:north|south|east|west|northeast|southeast|central|southwest|northwest)\-\d+$|^global$",
+    re.I,
+)
+
+def _s(v) -> str:
+    return v if isinstance(v, str) else ("" if v is None else str(v))
+
+def _normalize(s: str) -> str:
+    return (s or "").strip().lower()
+
+def _last_token(s: str) -> str:
+    s = _s(s)
+    if not s:
+        return ""
+    t = re.split(r"[/:]", s)
+    return t[-1] if t else s
+
+def _is_region_like(s: str) -> bool:
+    s = _s(s).strip()
+    if not s:
+        return False
+    return bool(REGION_RE.match(s))
+
+def _is_noise(s: str) -> bool:
+    s = _s(s)
+    if not s:
+        return False
+    if ARN_RE.match(s) or VOL_RE.search(s) or I_RE.search(s) or SG_RE.search(s) or ENI_RE.search(s) or SNAP_RE.search(s):
+        return False
+    if TG_PATH_RE.search(s) or ALB_PATH_RE.search(s) or NLB_PATH_RE.search(s):
+        return False
+    return bool(NOISED := NOISE_TOKEN_RE.match(s))
+
+def _arn_resource_part(arn: str) -> str:
+    m = ARN_RE.match(_s(arn))
+    if not m:
+        return _s(arn)
+    return m.group(5) or ""
+
+def _shorten_arn_generic(arn: str) -> str:
+    arn = _s(arn)
+    res = _arn_resource_part(arn)
+
+    if IAM_ARN_RE.match(arn):
+        return res.split("/", 1)[1] if "/" in res else res
+    if LAMBDA_FN_ARN_RE.search(arn):
+        return _last_token(res)
+    if res.startswith("table/"):
+        return res.split("/", 1)[1]
+    if ":sns:" in arn or ":sqs:" in arn:
+        return _last_token(res)
+    if ":ecr:" in arn and res.startswith("repository/"):
+        return res.split("/", 1)[1]
+    if ":ecs:" in arn and (res.startswith("service/") or res.startswith("cluster/")):
+        return res.split("/", 1)[1]
+    if ":eks:" in arn and res.startswith("cluster/"):
+        return res.split("/", 1)[1]
+    if ":rds:" in arn and (res.startswith("db:") or res.startswith("cluster:")):
+        return res.split(":", 1)[1]
+    if ":kms:" in arn and (res.startswith("key/") or res.startswith("alias/")):
+        return res.split("/", 1)[1]
+    return _last_token(res)
+
+def _shorten_arn(arn: str) -> str:
+    return _shorten_arn_generic(arn)
+
+def _dict_from_meta(meta_headers: List[str], meta_values: List[str]) -> Dict[str, str]:
+    d = {}
+    for h, v in zip(meta_headers or [], meta_values or []):
+        d[_normalize(_s(h))] = _s(v).strip()
+    return d
+
+def _pick_first(rx: re.Pattern, texts: List[str]) -> str:
+    for t in texts or []:
+        ts = _s(t)
+        m = rx.search(ts)
+        if m:
+            return m.group(0)
+    return ""
+
+def _has_lambda_version(texts: List[str]) -> str:
+    for v in texts or []:
+        sv = _s(v)
+        if LAMBDA_FN_ARN_RE.search(sv) and (":$" in sv or sv.endswith(":$LATEST")):
+            return sv
+    return ""
+
+def _is_human_name(s: str) -> bool:
+    s = _s(s)
+    if _is_noise(s) or _is_region_like(s):
+        return False
+    return bool(HUMAN_NAME_RE.match(s)) and not (VOL_RE.search(s) or I_RE.search(s))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ResourceId → 사람친화 (서비스 공통)
+# ─────────────────────────────────────────────────────────────────────────────
+def display_from_resource_id(resource_id: str, meta_vals: List[str]) -> str:
+    rid = _s(resource_id).strip()
+    if not rid or _is_noise(rid) or _is_region_like(rid):
+        return ""
+
+    for rx in [VOL_RE, I_RE, SG_RE, ENI_RE, SNAP_RE]:
+        m = rx.search(rid)
+        if m:
+            return m.group(0)
+
+    for rx in [TG_PATH_RE, ALB_PATH_RE, NLB_PATH_RE]:
+        m = rx.search(rid)
+        if m:
+            segs = m.group(0).split("/")
+            return segs[1] if len(segs) >= 2 else m.group(0)
+
+    if LAMBDA_FN_ARN_RE.search(rid):
+        if ":$" in rid or rid.endswith(":$LATEST"):
+            return rid
+        if ARN_RE.match(rid):
+            return _shorten_arn(rid)
+        return rid
+
+    if ARN_RE.match(rid):
+        full = _has_lambda_version(meta_vals)
+        if full:
+            return full
+        return _shorten_arn(rid)
+
+    if BUCKETISH_RE.match(rid) or _is_human_name(rid) or ("/" in rid and _is_human_name(rid)):
+        return rid
+
+    return ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Strong 메타 키(리소스 이름/ID급)
+# ─────────────────────────────────────────────────────────────────────────────
+STRONG_META_KEYS_ORDER = [
+    "bucket name",
+    "role name", "user name", "group name", "policy name",
+    "iam role", "iam user", "iam group", "iam policy",
+    "function name", "lambda function", "function",
+    "service name", "cluster name", "task definition", "workload",
+    "load balancer name", "elb name", "alb name", "nlb name", "target group",
+    "queue name", "topic name",
+    "table name", "db identifier", "db id", "cluster id", "database name",
+    "repository name",
+    "distribution id",
+    "domain name", "hosted zone name", "hosted zone id",
+    "resource name", "name", "display name", "id",
+    "instance id", "volume id", "volume arn", "security group id", "vpc id",
+    "cache cluster id", "cache node type",
+]
+
+def pick_strong_meta_id(meta_map: Dict[str, str], meta_vals: List[str]) -> str:
+    for key in STRONG_META_KEYS_ORDER:
+        v = meta_map.get(key)
+        if not v or _is_noise(v) or _is_region_like(v):
+            continue
+        if ARN_RE.match(v):
+            if LAMBDA_FN_ARN_RE.search(v) and (":$" in v or v.endswith(":$LATEST")):
+                return v
+            return _shorten_arn(v)
+        if any(rx.search(v) for rx in [VOL_RE, I_RE, SG_RE, ENI_RE, SNAP_RE]):
+            return v
+        for rx in [TG_PATH_RE, ALB_PATH_RE, NLB_PATH_RE]:
+            m = rx.search(v)
+            if m:
+                segs = m.group(0).split("/")
+                return segs[1] if len(segs) >= 2 else m.group(0)
+        if CFN_DISTR_ID_RE.match(v):
+            return v
+        if BUCKETISH_RE.match(v) or _is_human_name(v):
+            return v
+
+    mvals = [_s(x) for x in (meta_vals or []) if _s(x) and not _is_noise(x) and not _is_region_like(x)]
+
+    for rx in [IAM_ARN_RE, RDS_ARN_RE, KMS_ARN_RE, DDB_ARN_RE, SNS_ARN_RE, SQS_ARN_RE,
+               ECR_ARN_RE, EKS_ARN_RE, ECS_ARN_RE, OPENSEARCH_ARN_RE, REDSHIFT_ARN_RE]:
+        hit = _pick_first(rx, mvals)
+        if hit:
+            return _shorten_arn(hit)
+
+    for rx in [TG_PATH_RE, ALB_PATH_RE, NLB_PATH_RE]:
+        hit = _pick_first(rx, mvals)
+        if hit:
+            segs = hit.split("/")
+            return segs[1] if len(segs) >= 2 else hit
+
+    hit = _has_lambda_version(mvals)
+    if hit:
+        return hit
+    for val in mvals:
+        if LAMBDA_FN_ARN_RE.search(val):
+            return _shorten_arn(val)
+
+    hit = _pick_first(CFN_DISTR_ID_RE, mvals)
+    if hit:
+        return hit
+
+    for val in mvals:
+        if ROUTE53_ZONE_NAME_RE.match(val):
+            return val
+
+    for val in mvals:
+        if BUCKETISH_RE.match(val) and "." not in val:
+            return val
+
+    for val in mvals:
+        if _is_human_name(val):
+            return val
+
+    return ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (UPDATED) Name/Instance/Check 전용/조합 빌더
+# ─────────────────────────────────────────────────────────────────────────────
+def pick_name_tab(meta_headers: List[str], meta_map: Dict[str, str]) -> str:
+    """
+    2순위: meta_headers 순서로 스캔.
+    헤더에 'name' 포함 && 값이 사람친화면 즉시 채택.
+    """
+    for h in meta_headers or []:
+        k = _normalize(_s(h))
+        if "name" in k:
+            v = meta_map.get(k, "")
+            if v and _is_human_name(v):
+                return v
+    return ""
+
+def pick_instance_tab(meta_map: Dict[str, str]) -> str:
+    PREFER = ("db instance name", "db instance identifier", "instance identifier", "instance id", "db instance")
+    for pk in PREFER:
+        v = meta_map.get(pk)
+        if v and not _is_noise(v) and not _is_region_like(v):
+            return v
+    for key, v in meta_map.items():
+        if "instance" in key and v and not _is_noise(v) and not _is_region_like(v):
+            return v
+    return ""
+
+CHECK_TO_KEYS: List[Tuple[re.Pattern, List[str]]] = [
+    (re.compile(r"\bnat\s+gateway\s+az\s+independence\b", re.I), ["nat id", "nat gateway id", "nat gateway"]),
+]
+
+def pick_check_specific(check_name: str, meta_map: Dict[str, str]) -> str:
+    for pat, keys in CHECK_TO_KEYS:
+        if pat.search(check_name or ""):
+            for k in keys:
+                v = meta_map.get(k)
+                if v and not _is_noise(v) and not _is_region_like(v):
+                    return v
+    return ""
+
+# ── Service Limits / Quotas 동의어 테이블 ──
+SERVICE_LIMITS_SYNONYMS: Dict[str, List[str]] = {
+    "region": ["region", "aws region", "location"],
+    "service": ["service", "service name"],
+    "limit_amount": ["limit amount", "limit value", "limit", "limit name", "quota", "quota name", "quota value"],
+    "current_usage": ["current usage", "in use", "usage", "current value", "used"],
+    "status": ["status", "limit status", "violation status"],
+}
+
+def _get_by_synonyms_in_order(meta_headers: List[str], meta_map: Dict[str, str], keys: List[str]) -> str:
+    """
+    meta_headers 순서 우선, 정확 일치 → 부분 포함 순.
+    """
+    lh = [_normalize(_s(h)) for h in (meta_headers or [])]
+    # 정확 일치
+    for k in keys:
+        kk = _normalize(k)
+        if kk in meta_map and meta_map[kk]:
+            return meta_map[kk]
+    # 부분 포함 (헤더 순서 보존)
+    for h in lh:
+        for k in keys:
+            if _normalize(k) in h:
+                v = meta_map.get(h)
+                if v:
+                    return v
+    return ""
+
+def pick_service_limits_combo(meta_headers: List[str], meta_map: Dict[str, str], check_name: str) -> str:
+    n = _normalize(check_name)
+    if not any(tok in n for tok in ["service limit", "service limits", "service quota", "service quotas", "quota", "limit"]):
+        return ""
+
+    region        = _get_by_synonyms_in_order(meta_headers, meta_map, SERVICE_LIMITS_SYNONYMS["region"])
+    service       = _get_by_synonyms_in_order(meta_headers, meta_map, SERVICE_LIMITS_SYNONYMS["service"])
+    limit_amount  = _get_by_synonyms_in_order(meta_headers, meta_map, SERVICE_LIMITS_SYNONYMS["limit_amount"])
+    current_usage = _get_by_synonyms_in_order(meta_headers, meta_map, SERVICE_LIMITS_SYNONYMS["current_usage"])
+    status        = _get_by_synonyms_in_order(meta_headers, meta_map, SERVICE_LIMITS_SYNONYMS["status"])
+
+    parts = [p for p in [region, service, limit_amount, current_usage, status] if p and not _is_noise(p)]
+    parts = [p for p in parts if not _is_region_like(p) or p != region]  # region은 허용하되 단독 노출 방지
+    return " | ".join(parts) if parts else ""
+
+def pick_recommendation_summary(meta_headers: List[str], meta_map: Dict[str, str]) -> str:
+    """
+    8순위: 추천 요약을 최후 보루로 사용.
+    """
+    targets = ["recommended resource summary", "recommendation summary"]
+    for h in meta_headers or []:
+        k = _normalize(_s(h))
+        if any(t == k for t in targets) or any(t in k for t in targets):
+            v = meta_map.get(k, "")
+            if v:
+                return v
+    return ""
+
+def build_region_reason_combo(meta_map: Dict[str, str]) -> str:
+    region = meta_map.get("region") or meta_map.get("aws region") or ""
+    reason = meta_map.get("reason") or ""
+    parts = [p for p in [region, reason] if p and not _is_noise(p)]
+    if len(parts) >= 2:
+        return " | ".join(parts)
+    return ""
+
+def build_full_combo(meta_headers: List[str], meta_map: Dict[str, str]) -> str:
+    out: List[str] = []
+    for h in meta_headers or []:
+        key = _normalize(_s(h))
+        v = meta_map.get(key)
+        if not v:
+            continue
+        if _is_noise(v):
+            continue
+        if _is_region_like(v):
+            continue
+        out.append(v)
+    return " | ".join(out) if out else ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 서비스별 조합/요약 (기존-필요용)
+# ─────────────────────────────────────────────────────────────────────────────
+def compose_combo_or_summary(check_name: str, meta_map: Dict[str, str], meta_vals: List[str]) -> str:
+    n = _normalize(check_name)
+
+    if ("service limit" in n) or ("service quota" in n):
+        # 보조 루트(이제는 pick_service_limits_combo가 1차)
+        fields = ["region", "service", "limit amount", "current usage", "status"]
+        parts = [meta_map.get(k, "") for k in fields if meta_map.get(k)]
+        parts = [p for p in parts if p and not _is_noise(p)]
+        if parts and len(parts) >= 2:
+            return " | ".join(parts)
+
+    if "unassociated elastic ip" in n or ("elastic ip" in n and "unassociated" in n):
+        region = meta_map.get("region") or meta_map.get("aws region") or ""
+        ip = meta_map.get("ip address") or meta_map.get("public ip address") or meta_map.get("public ip") or ""
+        alloc = meta_map.get("allocation id") or meta_map.get("allocation-id") or ""
+        parts = [x for x in [region, ip, alloc] if x and not _is_noise(x)]
+        if len(parts) >= 2:
+            return " | ".join(parts)
+
+    if ("savings plan" in n) or ("savings plans" in n) or ("purchase recommendation" in n) or ("reserved node" in n) or ("recommendation" in n):
+        for k, v in meta_map.items():
+            if ("recommended resource summary" in k) or ("recommendation summary" in k):
+                if v and not _is_noise(v):
+                    return v
+
+    return ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 메타의 'Resource Id'/'ResourceId'/'Resource'에서 ResourceId 대체 (1순위 그룹 내부)
+# ─────────────────────────────────────────────────────────────────────────────
+def _from_meta_resource_like(meta_map: Dict[str, str], meta_vals: List[str]) -> str:
+    for key in ("resource id", "resourceid", "resource"):
+        v = meta_map.get(key)
+        if not v:
+            continue
+        if key == "resource" and v and not _is_noise(v) and not _is_region_like(v):
+            return v
+        disp = display_from_resource_id(v, meta_vals)
+        if disp:
+            return disp
+    return ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 최종 표시 문자열 생성 — ★새 우선순위 적용★
+# ─────────────────────────────────────────────────────────────────────────────
+def compose_display(check_name: str, meta_headers: List[str], meta_values: List[str], resource_id: str) -> str:
+    """
+    새 우선순위:
+    1) ResourceId / (메타) Resource Id / Resource
+    2) Name 포함 탭 (meta_headers 순서)
+    3) Strong
+    4) Instance 포함 탭/조합
+    5) 체크 전용 키
+    6) 특정 조합 (Service Limits/Quotas: Region | Service | Limit Amount | Current Usage | Status)
+    7) 전체 조합
+    8) Recommended Resource Summary / Recommendation Summary (최후 보루)
+    """
+    meta_vals = [_s(v) for v in (meta_values or []) if _s(v)]
+    meta_map = _dict_from_meta(meta_headers, meta_vals)
+
+    # 1) ResourceId
+    v1 = display_from_resource_id(resource_id, meta_vals)
+    if v1:
+        return v1
+    v1b = _from_meta_resource_like(meta_map, meta_vals)
+    if v1b:
+        return v1b
+
+    # 2) Name 포함 탭 (순서 보장)
+    v2 = pick_name_tab(meta_headers, meta_map)
+    if v2:
+        return v2
+
+    # 3) Strong
+    v3 = pick_strong_meta_id(meta_map, meta_vals)
+    if v3:
+        return v3
+
+    # 4) Instance 포함 탭/조합
+    v4 = pick_instance_tab(meta_map)
+    if v4:
+        return v4
+
+    # 5) 체크 전용 키
+    v5 = pick_check_specific(check_name, meta_map)
+    if v5:
+        return v5
+
+    # 6) Service Limits/Quotas 전용 조립 (우선)
+    v6 = pick_service_limits_combo(meta_headers, meta_map, check_name)
+    if v6:
+        return v6
+
+    # (보조) 과거 Region|Reason 조립
+    v6b = build_region_reason_combo(meta_map)
+    if v6b:
+        return v6b
+
+    # 7) 전체 조합
+    v7 = build_full_combo(meta_headers, meta_map)
+    if v7:
+        return v7
+
+    # 8) 추천 요약(최후 보루)
+    v8 = pick_recommendation_summary(meta_headers, meta_map)
+    if v8:
+        return v8
+
+    return ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TA 결과 조회 : 상태 카운트 + (주의/경고)별 표시 문자열 목록
+# ─────────────────────────────────────────────────────────────────────────────
+def fetch_check_result_summary(
+    support, check_id: str, meta_headers: List[str], check_name: str
 ) -> Tuple[int, int, int, int, str, Dict[str, List[str]]]:
     warn_count = 0
     error_count = 0
@@ -74,7 +557,7 @@ def fetch_check_result_summary_and_ids(
 
     next_token = None
     result_status_raw = None
-    status_to_ids: DefaultDict[str, List[str]] = defaultdict(list)
+    status_to_texts: DefaultDict[str, List[str]] = defaultdict(list)
 
     while True:
         for attempt in range(6):
@@ -99,8 +582,11 @@ def fetch_check_result_summary_and_ids(
         flagged = result.get("flaggedResources") or []
         for r in flagged:
             st_raw = (r.get("status") or "").lower().strip()
-            rid = (r.get("resourceId") or "").strip()
+            rid = _s(r.get("resourceId")).strip()
             is_suppressed = bool(r.get("isSuppressed"))
+            meta_vals = [ _s(v) for v in (r.get("metadata") or []) ]
+
+            display_text = compose_display(check_name, meta_headers, meta_vals, rid)
 
             if is_suppressed:
                 excluded_count += 1
@@ -112,18 +598,22 @@ def fetch_check_result_summary_and_ids(
             elif st_raw == "ok":
                 ok_count += 1
 
-            if (not is_suppressed) and rid:
+            if (not is_suppressed) and display_text:
                 if st_raw in ("ok", "warning", "error"):
-                    status_to_ids[st_raw].append(rid)
+                    status_to_texts[st_raw].append(display_text)
 
         next_token = resp.get("nextToken")
         if not next_token:
             break
 
     overall = STATUS_MAP_FINAL.get(result_status_raw, "미확인")
-    return error_count, warn_count, ok_count, excluded_count, overall, status_to_ids
+    return error_count, warn_count, ok_count, excluded_count, overall, status_to_texts
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 문자열 유틸 및 "리소스 값" 문자열 생성
+# ─────────────────────────────────────────────────────────────────────────────
 def split_on_commas(s: str) -> List[str]:
+    s = _s(s)
     if not s:
         return []
     s = s.replace("，", ",").replace("\u00A0", " ")
@@ -131,29 +621,31 @@ def split_on_commas(s: str) -> List[str]:
     parts = re.split(r",\s*", s)
     return [p.strip() for p in parts if p and p.strip()]
 
-def explode_ids(ids: List[str]) -> List[str]:
+def explode_unique(items: List[str]) -> List[str]:
     seen = set()
     out: List[str] = []
-    for s in ids:
-        for tok in split_on_commas(s):
-            if tok not in seen:
+    for s in items or []:
+        toks = split_on_commas(s) if ("," in _s(s)) else [_s(s)]
+        for tok in toks:
+            tok = tok.strip()
+            if tok and tok not in seen:
                 seen.add(tok)
                 out.append(tok)
     return out
 
-def build_resource_value_cell(status_to_ids: Dict[str, List[str]]) -> str:
+def build_resource_value_cell(status_to_texts: Dict[str, List[str]]) -> str:
     lines: List[str] = []
-    order = [("warning", "주의"), ("error", "경고")]  # 정상(ok)은 출력 제외
+    order = [("warning", "주의"), ("error", "경고")]  # 정상(ok) 제외
     for key, label in order:
-        raw_ids = status_to_ids.get(key, []) or []
-        ids = explode_ids(raw_ids)
-        if not ids:
+        raw = status_to_texts.get(key, []) or []
+        texts = explode_unique(raw)
+        if not texts:
             continue
         lines.append(f"{label} :")
-        lines.extend(ids)
+        lines.extend(texts)
     return "\n".join(lines)
 
-# ── 소스 종류 판별 (안전한 정규식) ──
+# ── 소스 종류 판별 ──
 SOURCE_RULES = [
     (re.compile(r"cost\s*optimization\s*hub", re.I), "AWS Cost Optimization Hub"),
     (re.compile(r"(?:compute|computer)\s*optimizer", re.I), "AWS Compute Optimizer"),
@@ -177,7 +669,7 @@ def main():
 
     support = session.client("support", region_name=SUPPORT_REGION)
 
-    # 체크 메타데이터 조회 (+ 빈 목록 방지용 재시도/로그)
+    # 체크 메타데이터 조회
     try:
         resp = support.describe_trusted_advisor_checks(language=LANGUAGE)
         checks: List[dict] = resp.get("checks", []) or []
@@ -204,7 +696,7 @@ def main():
         sys.stderr.write("[에러] 자격 증명을 찾을 수 없습니다.\n")
         sys.exit(1)
 
-    # 비어 있어도 "헤더만 있는 엑셀"을 생성하고 계속 진행
+    # 비어 있어도 "헤더만 있는 엑셀" 생성
     if not checks:
         print("가져올 Trusted Advisor 체크가 없습니다. (헤더만 생성)")
         df_all = pd.DataFrame(columns=[
@@ -215,7 +707,7 @@ def main():
         with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as xw:
             df_all.to_excel(xw, index=False, sheet_name="All")
             ws = xw.sheets["All"]
-            for col_name, width in [("리소스 값", 60), ("최종 상태", 14), ("소스 종류", 28)]:
+            for col_name, width in [("리소스 값", 80), ("최종 상태", 14), ("소스 종류", 28)]:
                 if col_name in df_all.columns:
                     idx = df_all.columns.get_loc(col_name) + 1
                     ws.column_dimensions[get_column_letter(idx)].width = width
@@ -227,22 +719,23 @@ def main():
 
     for c in checks:
         check_id = c.get("id")
-        name = c.get("name") or ""
+        check_name = c.get("name") or ""
         category = pretty_pillar_name(c.get("category"))
         description = (c.get("description") or "").strip()
+        meta_headers = c.get("metadata") or []   # 메타데이터 헤더
 
         try:
-            error_cnt, warn_cnt, ok_cnt, excl_cnt, overall, status_to_ids = (
-                fetch_check_result_summary_and_ids(support, check_id)
+            error_cnt, warn_cnt, ok_cnt, excl_cnt, overall, status_to_texts = (
+                fetch_check_result_summary(support, check_id, meta_headers, check_name)
             )
         except botocore.exceptions.ClientError as e:
-            sys.stderr.write(f"[경고] 체크 결과 조회 실패 ({check_id}, {name}): {e}\n")
+            sys.stderr.write(f"[경고] 체크 결과 조회 실패 ({check_id}, {check_name}): {e}\n")
             error_cnt = warn_cnt = ok_cnt = excl_cnt = 0
             overall = "미확인"
-            status_to_ids = {}
+            status_to_texts = {}
 
-        resource_value = build_resource_value_cell(status_to_ids)
-        source_type = detect_source(name=name, description=description, category=category)
+        resource_value = build_resource_value_cell(status_to_texts)
+        source_type = detect_source(name=check_name, description=description, category=category)
 
         if not sample_preview and resource_value:
             sample_preview = resource_value.replace("\n", "⏎")
@@ -250,7 +743,7 @@ def main():
         rows.append(
             {
                 "Check ID": check_id,
-                "Name": name,
+                "Name": check_name,
                 "Category": category,
                 "Description": description,
                 "경고(조치 권고)": error_cnt,
@@ -271,7 +764,7 @@ def main():
 
         if "리소스 값" in df_all.columns:
             col_idx = df_all.columns.get_loc("리소스 값") + 1
-            ws.column_dimensions[get_column_letter(col_idx)].width = 60
+            ws.column_dimensions[get_column_letter(col_idx)].width = 80
             for row in range(2, ws.max_row + 1):
                 cell = ws.cell(row=row, column=col_idx)
                 cell.alignment = Alignment(wrap_text=True, vertical="top")
@@ -287,8 +780,9 @@ def main():
     print(f"완료: {OUTPUT_XLSX} 생성 (All 시트)")
     if sample_preview:
         print(f"[PREVIEW] 첫 번째 '리소스 값' (개행표시=⏎): {sample_preview}")
-    print(" - '리소스 값'은 주의/경고만 포함, 각 리소스는 1줄 1개")
-    print(" - '소스 종류' 컬럼 추가 (키워드 기반 추정, 미매칭은 AWS Trusted Advisor)")
+    print(" - 새 우선순위 적용: ResourceId/Resource → Name(헤더순서) → Strong → Instance → Check전용 → ServiceLimits조합 → 전체조합 → 추천요약")
+    print(" - 난수형 메타토큰/리전 단독 값은 계속 필터링")
+    print(f"[INFO] Script version: {VERSION}")
 
 if __name__ == "__main__":
     main()
