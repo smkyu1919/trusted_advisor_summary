@@ -9,15 +9,25 @@ Trusted Advisor 체크 결과를 단일 시트(All)로 출력
 - 제외(isSuppressed=True)는 카운트만 반영
 - '소스 종류' 컬럼 (키워드 기반 추정)
 
-rv5m.5 (2025-10-22)
-- 2순위(Name 포함 탭): meta_headers 순서대로 스캔하며, 사람친화 값이면 즉시 채택 (DB Instance Name 강제 반영)
-- 1순위 보완: (메타)resource 값이 타입토큰(예: db.t3.micro) / 리전 단독 / 노이즈면 스킵하여 2순위로 떨어지게 함
-- 타입토큰 판정 추가(INSTANCE_CLASS_RE) 및 _is_human_name()에 반영
-- 6순위(Service Limits/Quotas): Region | Service | Limit Amount | Current Usage | Status 동의어 매핑 + 헤더 순서 우선
-- 8순위: Recommended Resource Summary / Recommendation Summary 최후 보루
-- 나머지(난수 토큰 차단, ARN 축약, Strong/Instance/Check/전체조합)는 변경 없음
+rv5m.6 (2025-10-22)
+- 우선순위 재정렬(헤더 기준, 모두 '행 메타 헤더 값'):
+  1) ResourceId / Resource Id / Resource (값이 '행 resourceId'와 일치할 경우는 표시 패스)
+  2) Identifier / Name (값이 '포함'된 헤더, 헤더순서 우선)
+  3) Instance (값이 '포함'된 헤더, type/class 제외, ARN 허용)
+  4) Strong (기존 STRONG_META_KEYS_ORDER)
+  5) 체크 전용 키 (예: NAT Gateway AZ Independence → NAT ID)
+  6) Recommended Resource Summary (정확 일치)
+  7) 연관성 묶음 조합 (Region | Reason)
+  8) 전체 조합 (난수/리전/AZ/타입토큰 제외)
+
+- pick_id_name_tab(): Identifier/Name 전용 스캐너(헤더순서 우선)
+- pick_instance_tab(): Instance 전용 스캐너(type/class 헤더 제외)
+- 1순위: 행 resourceId와 동일한 값은 표시용에서 패스(난수/원시 ID 노출 방지)
+- Recommended Resource Summary 안전 필터 보강
+- 환경성 컬럼(region/az) 및 값(region/AZ/인스턴스클래스/난수토큰) 제외 정책 유지
 """
 
+import os
 import sys
 import time
 import re
@@ -30,7 +40,23 @@ import pandas as pd
 from openpyxl.styles import Alignment
 from openpyxl.utils import get_column_letter
 
-VERSION = "rv5m.5-2025-10-22-007"
+
+# ───────────────────────────────────────────────────────────────────────────── 시작
+# 기본 정보
+# 기본 정보
+# 기본 정보
+# 기본 정보
+# 기본 정보
+# 접근 정보, 기본 셋팅 값
+# 기본 정보
+# 기본 정보
+# 기본 정보
+# 기본 정보
+# 기본 정보
+# ───────────────────────────────────────────────────────────────────────────── 시작
+
+
+VERSION = "rv5m.6-2025-10-22-045"
 OUTPUT_XLSX = "trusted_advisor_checks.xlsx"
 
 LANGUAGE = "en"              # en 또는 ja
@@ -65,9 +91,43 @@ def pretty_pillar_name(raw: str) -> str:
 def backoff_sleep(i: int):
     time.sleep(min(2 ** i, 10))
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────── 끝
+# 기본 정보
+# 기본 정보
+# 기본 정보
+# 기본 정보
+# 기본 정보
+# 접근 정보, 기본 셋팅 값
+# 기본 정보
+# 기본 정보
+# 기본 정보
+# 기본 정보
+# 기본 정보
+# ───────────────────────────────────────────────────────────────────────────── 끝
+
+
+
+
+
+
+
+
+
+
+
+# ───────────────────────────────────────────────────────────────────────────── 시작
 # 패턴/유틸
-# ─────────────────────────────────────────────────────────────────────────────
+# 패턴/유틸
+# 패턴/유틸
+# 패턴/유틸
+# 패턴/유틸
+# ───────────────────────────────────────────────────────────────────────────── 시작
+
+# ── 디버그 스위치 ──
+TA_DEBUG = os.getenv("TA_DEBUG", "0") == "1"   # 1이면 상세 디버그 출력
+TA_DEBUG_CHECK = os.getenv("TA_DEBUG_CHECK", "")  # 특정 체크명 필터(정규식). 예: "Idle Load Balancers|Amazon RDS Idle DB Instances"
+TA_DEBUG_MAX = int(os.getenv("TA_DEBUG_MAX", "50"))  # 행별 최대 출력 줄수 안전장치
+
 ARN_RE = re.compile(r"^arn:(aws|aws-cn|aws-us-gov):([a-z0-9\-]+):([a-z0-9\-]*):(\d{12})?:(.+)$")
 LAMBDA_FN_ARN_RE = re.compile(r"arn:[^:]+:lambda:[^:]+:\d{12}:function[:/][A-Za-z0-9-_]+(?::[A-Za-z0-9\-\$._+]+)?")
 
@@ -104,26 +164,287 @@ BUCKETISH_RE = re.compile(r"^[a-z0-9][a-z0-9\.\-]{1,61}[a-z0-9]$")
 HUMAN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-\/]{2,200}$")
 NOISE_TOKEN_RE = re.compile(r"^[A-Za-z0-9\-_]{24,}$")
 
-# RDS DB 인스턴스 이름/식별자 형태 허용 (소문자/숫자/하이픈, 최대 63자)
 # RDS DB 인스턴스 식별자: 소문자/숫자/하이픈, 최대 63자
 RDS_IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 AZ_RE = re.compile(r"^(?:us|ap|eu|me|af|sa|ca)-[a-z]+-\d+[a-z]$", re.I)
 
-
-
+# NAT GW ID 형태: nat- + 8~32자리 hex
+NAT_ID_RE = re.compile(r"\bnat-[0-9a-f]{8,32}\b", re.I)
 
 REGION_RE = re.compile(
     r"^(?:us|ap|eu|me|af|sa|ca)-(?:north|south|east|west|northeast|southeast|central|southwest|northwest)\-\d+$|^global$",
     re.I,
 )
 
-# ▼ 추가: EC2/RDS 등 인스턴스 클래스(타입 토큰) 판정
+# ▼ EC2/RDS 등 인스턴스 클래스(타입 토큰)
 INSTANCE_CLASS_RE = re.compile(
     r"^(?:db\.[a-z0-9.]+|"
     r"(?:[cmrtgipdhnxz][0-9a-z]?)\.(?:nano|micro|small|medium|large|xlarge|[2-9]xlarge)|"
     r"[a-z][0-9][a-z]?\.[a-z0-9.]+)$",
     re.I,
 )
+
+TOP_RESOURCE_KEYS_EXACT = ("resource id", "resourceid", "resource")
+
+# ───────────────────────────────────────────────────────────────────────────── 끝
+# 패턴/유틸
+# 패턴/유틸
+# 패턴/유틸
+# 패턴/유틸
+# 패턴/유틸
+# ───────────────────────────────────────────────────────────────────────────── 끝
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ───────────────────────────────────────────────────────────────────────────── 시작
+# 디버그
+# 디버그
+# 디버그
+# 디버그
+# 디버그
+# (디버그) 상단
+# 디버그
+# 디버그
+# 디버그
+# 디버그
+# 디버그
+# ───────────────────────────────────────────────────────────────────────────── 시작
+
+# ── 콘솔 트레이스: 관심 체크만 출력 ──
+TRACE_CHECKS = {
+    "idle load balancers",
+    "amazon rds idle db instances",
+}
+
+def _lc(s: str) -> str:
+    return (s or "").strip().lower()
+
+def _trace_on(check_name: str) -> bool:
+    return _lc(check_name) in TRACE_CHECKS
+
+def _log(*args):
+    try:
+        print("[TRACE]", *args)
+    except Exception:
+        pass
+
+def _scan_tokens(meta_headers: List[str], meta_map: Dict[str, str], tokens: Tuple[str, ...], ban_substr: Tuple[str, ...]) -> List[Tuple[str, str, str]]:
+    """
+    헤더 순서대로 tokens '포함' 매칭. (k=정규화 헤더)
+    반환: [(k, value, reason)]
+    """
+    out: List[Tuple[str, str, str]] = []
+    TOKENS_LC = tuple(t.lower() for t in tokens)
+    for h in (meta_headers or []):
+        k = _normalize(_s(h))
+        if not k:
+            continue
+        if any(tok in k for tok in TOKENS_LC):
+            if any(b in k for b in ban_substr):
+                out.append((k, meta_map.get(k, ""), "reject: banned header(type/class)"))
+                continue
+            v = (meta_map.get(k, "") or "").strip()
+            if not v:
+                out.append((k, v, "reject: empty"))
+                continue
+            if _is_region_like(v) or AZ_RE.match(v):
+                out.append((k, v, "reject: region/az-like value"))
+                continue
+            # ▶ 이름/식별자 헤더일 때는 노이즈 토큰이라도 허용
+            if _is_noise(v) and not _is_namey_header(k):
+                out.append((k, v, "reject: noise token"))
+                continue
+            if INSTANCE_CLASS_RE.match(v):
+                out.append((k, v, "reject: instance class token"))
+                continue
+            if ARN_RE.match(v):
+                out.append((k, v, "accept: arn"))
+                continue
+            if RDS_IDENTIFIER_RE.match(v):
+                out.append((k, v, "accept: rds identifier"))
+                continue
+            out.append((k, v, "accept: generic"))
+    return out
+
+
+def _trace_candidates(check_name: str, meta_headers: List[str], meta_map: Dict[str, str]) -> None:
+    if not _trace_on(check_name):
+        return
+    _log("=" * 72)
+    _log("CHECK:", check_name)
+    for i, h in enumerate(meta_headers or []):
+        k = _normalize(_s(h))
+        _log(f"[H{i:02d}] {h!r} → {k!r} => {meta_map.get(k, '')!r}")
+
+    # 2순위: Identifier/Name
+    name_tokens = (
+        "identifier", "name", "이름", "display name",
+        "db instance name", "db instance identifier", "db identifier", "database name", "db instance",
+        "load balancer name", "load balancer", "elb name", "alb name", "nlb name",
+        "cluster name", "cluster identifier", "resource name", "hosted zone name",
+        "table name", "queue name", "topic name", "repository name",
+    )
+    rows2 = _scan_tokens(meta_headers, meta_map, name_tokens, ban_substr=(" type", "type", "class"))
+    if rows2:
+        _log("2순위 후보(Name/Identifier):")
+        for k, v, why in rows2:
+            _log("  -", k, "=>", v, f"({why})")
+    else:
+        _log("2순위 후보(Name/Identifier): 없음")
+
+    # 3순위: Instance
+    inst_tokens = ("instance", "target group")
+    rows3 = _scan_tokens(meta_headers, meta_map, inst_tokens, ban_substr=(" type", "type", "class"))
+    if rows3:
+        _log("3순위 후보(Instance):")
+        for k, v, why in rows3:
+            _log("  -", k, "=>", v, f"({why})")
+    else:
+        _log("3순위 후보(Instance): 없음")
+
+
+# (디버그) 특정 체크의 헤더/값 출력
+# def _debug_print_meta_for_rds_backups(check_name: str, meta_headers: List[str], meta_vals: List[str], rid: str, st: str):
+#     if "rds backups" not in (check_name or "").lower():
+#         return
+#     try:
+#         pairs = []
+#         for i, (h, v) in enumerate(zip(meta_headers or [], meta_vals or [])):
+#             pairs.append(f"  [{i:02d}] {h!r} => {v!r}")
+#         print("[DEBUG][RDS Backups] resourceId =", rid)
+#         print("[DEBUG][RDS Backups] status     =", st)
+#         print("[DEBUG][RDS Backups] meta map:")
+#         print("\n".join(pairs))
+#         print("-" * 60)
+#     except Exception as e:
+#         print("[DEBUG][RDS Backups] print error:", e)
+
+# ───────────────────────────────────────────────────────────────────────────── 하단
+# 디버그
+# 디버그
+# 디버그
+# 디버그
+# 디버그
+# (디버그) 하단
+# 디버그
+# 디버그
+# 디버그
+# 디버그
+# 디버그
+# ───────────────────────────────────────────────────────────────────────────── 하단
+
+
+
+
+
+
+
+
+
+
+# ───────────────────────────────────────────────────────────────────────────── 시작
+# 스캐너
+# 스캐너
+# 스캐너
+# 스캐너
+# 스캐너
+# 스캐너 / 조건식
+# 스캐너
+# 스캐너
+# 스캐너
+# 스캐너
+# 스캐너
+# ───────────────────────────────────────────────────────────────────────────── 시작
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 보조 판정기
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _is_human_friendly_for_name(s: str, *, header_key: str = "") -> bool:
+    s = _s(s).strip()
+    if not s:
+        return False
+    if s.lower().startswith("arn:"):
+        return False
+    if _is_region_like(s):
+        return False
+    if INSTANCE_CLASS_RE.match(s):  # db.t3.micro 등
+        return False
+
+    k = _normalize(_s(header_key))
+    if ("name" in k) or ("이름" in k):
+        if RDS_IDENTIFIER_RE.match(s):
+            return True
+
+    if _is_noise(s):
+        return False
+    return True
+
+def _is_iam_access_analyzer_check(name: str) -> bool:
+    return "iam access analyzer" in (name or "").lower()
+
+def _is_iam_ak_rotation_check(name: str) -> bool:
+    return "access key rotation" in (name or "").lower()
+
+def _is_password_policy_check(name: str) -> bool:
+    """체크명에 'password policy'가 포함되면 True"""
+    return "password policy" in (name or "").lower()
+
+
+def _is_zone_balance_check(name: str) -> bool:
+    """체크명에 'Zone Balance'가 포함되면 True"""
+    return "zone balance" in (name or "").lower()
+
+def _is_ecs_check(name: str) -> bool:
+    """체크명에 'ECS'가 포함되면 True"""
+    return "ecs" in (name or "").lower()
+
+def _is_ebs_check(name: str) -> bool:
+    """체크명에 'EBS'가 포함되면 True"""
+    return "ebs" in (name or "").lower()
+
+def _is_namey_header(header_lc: str) -> bool:
+    """
+    '이름/식별자' 성격의 헤더면 True.
+    이런 헤더는 값이 해시형/길어도 노이즈로 보지 않는다.
+    """
+    k = (header_lc or "").strip().lower()
+    NAMEY_KEYS = (
+        "name", "이름", "identifier", "display name",
+        "db instance name", "db instance identifier", "db identifier", "database name", "db instance",
+        "load balancer name", "load balancer", "elb name", "alb name", "nlb name",
+        "cluster name", "cluster identifier",
+        "resource name", "hosted zone name",
+        "table name", "queue name", "topic name", "repository name",
+        "target group"
+    )
+    return any(tok in k for tok in NAMEY_KEYS)
+
+def _is_purchase_reco_check(name: str) -> bool:
+    """체크명에 'Purchase Recommendations'가 포함되면 True"""
+    return "purchase recommendations" in (name or "").lower()
+
+
+def _is_nataz_header(key_lc: str) -> bool:
+    """'nat availability zone'같은 AZ성 헤더인지 판별"""
+    k = (key_lc or "").strip().lower()
+    return ("availability zone" in k) or (k.endswith(" az")) or (" az " in k)
+
+def _is_nat_check(name: str) -> bool:
+    return "nat" in (name or "").lower()
 
 def _s(v) -> str:
     return v if isinstance(v, str) else ("" if v is None else str(v))
@@ -213,10 +534,159 @@ def _is_human_name(s: str) -> bool:
     s = _s(s)
     if _is_noise(s) or _is_region_like(s):
         return False
-    # ▼ 타입 토큰은 사람친화 아님 (예: db.t3.micro, c6i.2xlarge 등)
     if INSTANCE_CLASS_RE.match(s):
         return False
     return bool(HUMAN_NAME_RE.match(s)) and not (VOL_RE.search(s) or I_RE.search(s))
+
+def pick_nat_id_preferred(meta_headers: List[str], meta_map: Dict[str, str]) -> str:
+    """
+    NAT 계열 체크에서만 사용.
+    meta_headers '순서'대로 스캔하여
+    - 헤더가 'nat id' 또는 'nat gateway id' 면 그 값을 반환.
+    - 값 필터: 공백/Region/AZ/InstanceClass 배제 (노이즈 필터 레벨은 건드리지 않음)
+    - 값이 NAT_ID_RE에 맞으면 그대로 반환, 아니어도 위 배제조건만 넘기면 허용.
+    """
+    TARGET_KEYS = ("nat id", "nat gateway id")
+    for h in (meta_headers or []):
+        k = _normalize(_s(h))
+        if k in TARGET_KEYS:
+            v = (meta_map.get(k, "") or "").strip()
+            if not v:
+                continue
+            # 값 안전 필터 (노이즈 레벨 변경 없음)
+            if _is_region_like(v) or AZ_RE.match(v) or INSTANCE_CLASS_RE.match(v):
+                continue
+            # NAT ID 패턴이면 그대로
+            m = NAT_ID_RE.search(v)
+            if m:
+                return m.group(0)
+            # 패턴이 아니어도(예: ARN, 라벨 변형) 위 배제만 통과하면 사용
+            if ARN_RE.match(v):
+                return v
+            return v
+    return ""
+
+def pick_ebs_volume_id_preferred(meta_headers: List[str], meta_map: Dict[str, str]) -> str:
+    """
+    EBS 계열 체크에서만 사용.
+    meta_headers '순서'대로 스캔하여 헤더가 'volume id'면 그 값을 우선 반환.
+    - 값 필터: 공백/Region/AZ/InstanceClass 배제 (노이즈 필터 레벨은 건드리지 않음)
+    - 값이 'vol-...' 패턴이면 그대로 반환, 아니어도 위 배제조건만 넘기면 허용.
+    """
+    TARGET_KEY = "volume id"
+    for h in (meta_headers or []):
+        k = _normalize(_s(h))
+        if k == TARGET_KEY:
+            v = (meta_map.get(k, "") or "").strip()
+            if not v:
+                continue
+            # 안전 필터 (레벨 변경 없음)
+            if _is_region_like(v) or AZ_RE.match(v) or INSTANCE_CLASS_RE.match(v):
+                continue
+            # 전형적인 EBS 볼륨 ID면 그대로 반환
+            m = VOL_RE.search(v)
+            if m:
+                return m.group(0)
+            # 패턴이 아니어도(예: 포맷 변형) 유효하면 사용
+            return v
+    return ""
+
+def pick_ecs_resource_tail(meta_headers: List[str], meta_map: Dict[str, str]) -> str:
+    """
+    ECS 계열 체크에서만 사용.
+    meta_headers 순서대로 'resource' / 'resource id' / 'resourceid' 헤더를 찾아
+    값이 ECS ARN이면, 마지막 '/' 뒤의 문자열 전체(예: 'aaa:1')를 반환.
+    - 기존 shorten 로직은 쓰지 않음(':' 기준 잘림 방지).
+    - 값이 없거나 ARN이 아니면 스킵하고 패스.
+    """
+    TARGET_KEYS = ("resource", "resource id", "resourceid")
+    for h in (meta_headers or []):
+        k = _normalize(_s(h))
+        if k in TARGET_KEYS:
+            v = (meta_map.get(k, "") or "").strip()
+            if not v:
+                continue
+            if ARN_RE.match(v) and ":ecs:" in v:
+                # arn의 resource part: e.g. 'task-definition/aaa:1'
+                res_part = _arn_resource_part(v)
+                if "/" in res_part:
+                    tail = res_part.split("/")[-1].strip()
+                    if tail:
+                        return tail     # 예: 'aaa:1'
+            # ARN이 아니면 패스(다음 우선순위로 진행)
+    return ""
+
+def pick_zone_balance_all_values(meta_headers: List[str], meta_vals: List[str]) -> str:
+    """
+    Zone Balance 계열: 각 행의 '모든 메타데이터 값'을 원래 순서대로
+    두 칸 공백으로 연결해서 반환한다.
+    - 빈 값은 건너뛰고, 나머지는 가공/축약 없이 그대로 사용.
+    - 헤더명은 포함하지 않고 '값'만 나열.
+    """
+    values: List[str] = []
+    for v in (meta_vals or []):
+        vv = (v or "").strip()
+        if vv:
+            values.append(vv)
+    return "  ".join(values) if values else ""
+
+def pick_password_policy_all_kv(meta_headers: List[str], meta_vals: List[str]) -> str:
+    """
+    Password Policy 계열: 각 행의 모든 메타데이터를
+    '헤더: 값' 형태로 두 칸 공백으로 연결해서 반환.
+    - 빈 값은 건너뜀
+    - 원본 헤더 표기(meta_headers) 보존
+    """
+    parts: List[str] = []
+    for h, v in zip(meta_headers or [], meta_vals or []):
+        vv = (v or "").strip()
+        if not vv:
+            continue
+        hh = str(h or "").strip()
+        parts.append(f"{hh}: {vv}")
+    return "  ".join(parts) if parts else ""
+
+def pick_region_only(meta_headers: List[str], meta_map: Dict[str, str]) -> str:
+    """
+    IAM Access Analyzer 전용: Region만 반환.
+    meta_headers 순서/동의어를 고려해 region 값을 찾아 반환.
+    """
+    # 기존 유틸 재사용 (동의어 우선 탐색)
+    v = _get_by_synonyms_in_order(meta_headers, meta_map, ["region", "aws region", "location"])
+    return (v or "").strip()
+
+def pick_iam_user_plus_reason(meta_headers: List[str], meta_map: Dict[str, str]) -> str:
+    """
+    IAM Access Key Rotation 전용: 'IAM User' + 'Reason' 를 두 칸 공백으로 연결하여 반환.
+    - 정확키 우선 → 부분일치 보조
+    """
+    def _find_value(keys_exact: Tuple[str, ...], token_partial: str) -> str:
+        # 1) 정확 일치 키 우선
+        for k in keys_exact:
+            v = meta_map.get(k)
+            if v:
+                vv = (v or "").strip()
+                if vv:
+                    return vv
+        # 2) 부분일치 (헤더에 토큰이 포함되면)
+        for h in (meta_headers or []):
+            kl = _normalize(_s(h))
+            if token_partial in kl:
+                v = (meta_map.get(kl, "") or "").strip()
+                if v:
+                    return v
+        return ""
+
+    user = _find_value(("iam user",), "iam user")
+    if not user:
+        user = _find_value(("user", "user name"), "user")  # 보조
+
+    reason = _find_value(("reason",), "reason")
+
+    parts = [p for p in [user, reason] if p]
+    return "  ".join(parts) if parts else ""
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ResourceId → 사람친화 (서비스 공통)
@@ -254,31 +724,6 @@ def display_from_resource_id(resource_id: str, meta_vals: List[str]) -> str:
         return rid
 
     return ""
-
-# --- ADD: Name 전용 사람친화 판정 (난수/리전/ARN/타입토큰 제외, 그 외 널널히 허용)
-def _is_human_friendly_for_name(s: str, *, header_key: str = "") -> bool:
-    s = _s(s).strip()
-    if not s:
-        return False
-    if s.lower().startswith("arn:"):
-        return False
-    if _is_region_like(s):
-        return False
-    if INSTANCE_CLASS_RE.match(s):  # db.t3.micro 등
-        return False
-
-    k = _normalize(_s(header_key))
-    # Name/이름 헤더일 때: RDS 식별자 형태는 허용 (NOISE_TOKEN_RE에 걸려도 통과)
-    if ("name" in k) or ("이름" in k):
-        if RDS_IDENTIFIER_RE.match(s):
-            return True
-
-    # 일반 규칙: 너무 난수스러운 토큰은 차단
-    if _is_noise(s):
-        return False
-    return True
-
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Strong 메타 키(리소스 이름/ID급)
@@ -361,89 +806,155 @@ def pick_strong_meta_id(meta_map: Dict[str, str], meta_vals: List[str]) -> str:
     return ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Name/Instance/Check 전용/조합 빌더 (업데이트 포함)
+# 새 2순위: Identifier/Name/Instance 통합 스캐너
 # ─────────────────────────────────────────────────────────────────────────────
-# --- REPLACE THIS FUNCTION ---
-def pick_name_tab(meta_headers: List[str], meta_map: Dict[str, str]) -> str:
+def pick_id_name_instance_tab(meta_headers: List[str], meta_map: Dict[str, str]) -> str:
     """
-    2순위: meta_headers 순서로 스캔.
-    헤더에 'name' 또는 '이름'이 포함되면, 값이 사람친화(완화)일 때 즉시 채택.
+    2순위: Identifier/Name/Instance '포함' 헤더를 meta_headers '순서대로' 스캔.
+    - 'type' / 'class' 포함 헤더는 제외
+    - 값 필터: Region/AZ/InstanceClass/Noise 토큰 제외
+    - ARN은 그대로 허용(축약하지 않음)
+    - RDS 식별자 패턴 허용
     """
-    for h in meta_headers or []:  # 헤더 순서 보존
-        k = _normalize(_s(h))
-        if ("name" in k) or ("이름" in k):
-            v = meta_map.get(k, "")
-            if _is_human_friendly_for_name(v, header_key=k):
-                return v
-    return ""
+    KEY_TOKENS = (
+        # 기본 키워드
+        "identifier", "name", "이름", "instance",
+        # 로드밸런서/타깃/식별자 변형
+        "load balancer name", "elb name", "alb name", "nlb name",
+        "load balancer", "target group",
+        # rds/db 계열
+        "db instance name", "db instance identifier",
+        "db instance", "db identifier",
+        "rds instance", "database", "cluster identifier", "cluster name"
+    )
 
-
-# --- REPLACE THIS FUNCTION ---
-# --- REPLACE THIS FUNCTION ---
-# --- REPLACE THIS FUNCTION COMPLETELY ---
-# --- REPLACE WHOLE FUNCTION ---
-# --- REPLACE WHOLE FUNCTION ---
-# --- REPLACE WHOLE FUNCTION ---
-def pick_instance_tab(meta_headers: List[str], meta_map: Dict[str, str]) -> str:
-    """
-    4순위: 'instance'가 들어간 헤더 값을, 헤더(meta_headers) 순서 우선으로 채택.
-    - 'instance type' / 'instance class'는 제외(대표 리소스가 아님)
-    - 값이 비어있지만 않으면 관대하게 채택
-      * 리전/AZ/인스턴스 타입 토큰/난수 토큰만 제외
-      * ARN은 '그대로' 반환(축약하지 않음)
-    - 한국어/일본어 헤더도 지원
-    """
     def _accept(v: str) -> str:
         v = (v or "").strip()
         if not v:
             return ""
-        # 타입토큰/리전/노이즈 제외
-        if INSTANCE_CLASS_RE.match(v) or _is_region_like(v) or _is_noise(v):
+        if _is_region_like(v) or AZ_RE.match(v) or INSTANCE_CLASS_RE.match(v) or _is_noise(v):
             return ""
-        # ARN은 그대로 통과 (축약 금지)
         if ARN_RE.match(v):
+            return v  # 축약하지 않음
+        if RDS_IDENTIFIER_RE.match(v):
             return v
         return v
 
-    # 1) 헤더 순서 우선 스캔 (예: 'DB Instance'가 가장 먼저면 그걸 우선)
-    for h in meta_headers or []:
+    for h in (meta_headers or []):
         k = _normalize(_s(h))
-        if (("instance" in k) or ("인스턴스" in k) or ("インスタンス" in k)) and ("type" not in k) and ("class" not in k):
-            acc = _accept(meta_map.get(k))
-            if acc:
-                return acc
-
-    # 2) 그래도 없으면 모든 키 재스캔(부분 포함 허용)
-    for k, v in meta_map.items():
-        kk = _normalize(k)
-        if (("instance" in kk) or ("인스턴스" in kk) or ("インスタンス" in kk)) and ("type" not in kk) and ("class" not in kk):
+        if any(tok in k for tok in KEY_TOKENS):
+            if "type" in k or "class" in k:
+                continue
+            v = meta_map.get(k, "")
             acc = _accept(v)
             if acc:
                 return acc
-
     return ""
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 1순위: 헤더 Resource* 가 행 resourceId와 '값 일치'하는지 판정(표시에는 사용 X)
+# ─────────────────────────────────────────────────────────────────────────────
+def _resource_header_same_as_row_resource_id(meta_headers: List[str], meta_map: Dict[str, str], resource_id: str) -> bool:
+    """
+    헤더가 'resourceid' / 'resource id' / 'resource' 이고,
+    '값'이 행 resourceId와 '일치'하는지 확인 (난수토큰 그대로 노출 방지)
+    """
+    rid = (resource_id or "").strip()
+    if not rid:
+        return False
+    TARGET_KEYS = ("resourceid", "resource id", "resource")
+    for h in (meta_headers or []):
+        k = _normalize(_s(h))
+        if k in TARGET_KEYS:
+            if (meta_map.get(k, "").strip() == rid):
+                return True
+    return False
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 체크 전용/조합 빌더
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-
-
-
+# 체크 전용/조합 빌더 (보강된 NAT 규칙)
 CHECK_TO_KEYS: List[Tuple[re.Pattern, List[str]]] = [
-    (re.compile(r"\bnat\s+gateway\s+az\s+independence\b", re.I), ["nat id", "nat gateway id", "nat gateway"]),
+    (
+        re.compile(
+            r"\bnat(\s*-\s*|\s+)?gateway\b.*\b(az|availability\s*zone)\b.*\b(independence|redundan|separate|multi-az)?\b",
+            re.I
+        ),
+        [
+            "nat id", "nat gateway id", "nat-gateway id", "nat gateway identifier",
+            "nat gateway arn", "nat gateway", "nat-gateway", "natgw id", "natgw"
+        ],
+    ),
 ]
 
-def pick_check_specific(check_name: str, meta_map: Dict[str, str]) -> str:
-    for pat, keys in CHECK_TO_KEYS:
-        if pat.search(check_name or ""):
-            for k in keys:
-                v = meta_map.get(k)
-                if v and not _is_noise(v) and not _is_region_like(v):
-                    return v
+
+
+
+def pick_check_specific(check_name: str, meta_map: Dict[str, str], meta_headers: List[str], meta_vals: List[str]) -> str:
+    """
+    체크명과 매칭되면 전용 키 우선 탐색 → 실패 시 값 전체에서 패턴 스캔.
+    AZ/Region/타입/노이즈 등은 필터.
+    """
+    cn = (check_name or "")
+    for pat, want_keys in CHECK_TO_KEYS:
+        if not pat.search(cn):
+            continue
+
+        # 1) 라벨 기반 탐색 (부분일치 허용)
+        for want in want_keys:
+            want_lc = (want or "").strip().lower()
+            for k, v in meta_map.items():
+                if want_lc in (k or ""):
+                    val = (v or "").strip()
+                    if not val:
+                        continue
+                    if _is_region_like(val) or AZ_RE.match(val):
+                        continue
+                    if (not _is_namey_header(k)) and _is_noise(val):
+                        continue
+                    if INSTANCE_CLASS_RE.match(val):
+                        continue
+                    return val
+
+        # 2) 라벨 변형 느슨 매칭 (언더스코어/하이픈 정규화)
+        for k, v in meta_map.items():
+            k2 = (k or "").replace("_", " ").replace("-", " ")
+            for want in want_keys:
+                if (want or "").replace("-", " ") in k2:
+                    val = (v or "").strip()
+                    if not val:
+                        continue
+                    if _is_region_like(val) or AZ_RE.match(val):
+                        continue
+                    if (not _is_namey_header(k)) and _is_noise(val):
+                        continue
+                    if INSTANCE_CLASS_RE.match(val):
+                        continue
+                    return val
+
+        # 3) ★ 값 전체에서 NAT ID 직접 스캔 (라벨이 애매해도 캐치)
+        blob_vals: List[str] = []
+        blob_vals.extend([str(v) for v in (meta_map or {}).values() if v])
+        blob_vals.extend([str(v) for v in (meta_vals or []) if v])
+
+        for v in blob_vals:
+            m = NAT_ID_RE.search(v)
+            if not m:
+                continue
+            nat_id = m.group(0)
+            # 안전 필터 (형식상 AZ/Region/타입/노이즈 아님)
+            if _is_region_like(nat_id) or AZ_RE.match(nat_id) or INSTANCE_CLASS_RE.match(nat_id):
+                continue
+            return nat_id
+
     return ""
 
-# ── Service Limits / Quotas 동의어 테이블 ──
+
+
+
+# Service Limits / Quotas 동의어
 SERVICE_LIMITS_SYNONYMS: Dict[str, List[str]] = {
     "region": ["region", "aws region", "location"],
     "service": ["service", "service name"],
@@ -453,16 +964,11 @@ SERVICE_LIMITS_SYNONYMS: Dict[str, List[str]] = {
 }
 
 def _get_by_synonyms_in_order(meta_headers: List[str], meta_map: Dict[str, str], keys: List[str]) -> str:
-    """
-    meta_headers 순서 우선, 정확 일치 → 부분 포함 순.
-    """
     lh = [_normalize(_s(h)) for h in (meta_headers or [])]
-    # 정확 일치
     for k in keys:
         kk = _normalize(k)
         if kk in meta_map and meta_map[kk]:
             return meta_map[kk]
-    # 부분 포함 (헤더 순서 보존)
     for h in lh:
         for k in keys:
             if _normalize(k) in h:
@@ -470,6 +976,130 @@ def _get_by_synonyms_in_order(meta_headers: List[str], meta_map: Dict[str, str],
                 if v:
                     return v
     return ""
+
+def pick_id_name_tab(meta_headers: List[str], meta_map: Dict[str, str]) -> str:
+    """
+    2순위: Identifier / Name 계열만 스캔 (헤더 '순서' 우선)
+    - 'type' / 'class' 포함 헤더는 제외
+    - 값 필터: Region/AZ/InstanceClass 제외
+    - ▶ 이름/식별자 헤더는 노이즈 토큰이어도 허용 (콘솔/TA가 해시형 이름을 주는 케이스 대응)
+    - ARN은 그대로 허용(축약하지 않음)
+    - RDS 식별자 패턴 허용
+    """
+    KEY_TOKENS = (
+        "identifier", "name", "이름", "display name",
+        "db instance name", "db instance identifier", "db identifier", "database name", "db instance",
+        "load balancer name", "load balancer", "elb name", "alb name", "nlb name",
+        "cluster name", "cluster identifier", "resource name", "hosted zone name",
+        "table name", "queue name", "topic name", "repository name"
+    )
+    TOKENS_LC = tuple(t.lower() for t in KEY_TOKENS)
+
+    for h in (meta_headers or []):
+        k = _normalize(_s(h))  # 소문자화
+        if any(tok in k for tok in TOKENS_LC):
+            if "type" in k or "class" in k:
+                continue
+            v = (meta_map.get(k, "") or "").strip()
+            if not v:
+                continue
+            if _is_region_like(v) or AZ_RE.match(v):
+                continue
+            # ▶ 이름/식별자 헤더는 노이즈라도 허용
+            if (not _is_namey_header(k)) and _is_noise(v):
+                continue
+            if INSTANCE_CLASS_RE.match(v):
+                continue
+            if ARN_RE.match(v):
+                return v
+            if RDS_IDENTIFIER_RE.match(v):
+                return v
+            return v  # generic 허용
+    return ""
+
+
+    def _accept(v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            return ""
+        if _is_region_like(v) or AZ_RE.match(v) or _is_noise(v) or INSTANCE_CLASS_RE.match(v):
+            return ""
+        if ARN_RE.match(v):
+            return v
+        if RDS_IDENTIFIER_RE.match(v):
+            return v
+        return v
+
+    for h in (meta_headers or []):
+        k = _normalize(_s(h))  # 소문자화
+        if any(tok in k for tok in TOKENS_LC):
+            if "type" in k or "class" in k:
+                continue
+            v = meta_map.get(k, "")
+            acc = _accept(v)
+            if acc:
+                return acc
+    return ""
+
+def pick_instance_tab(meta_headers: List[str], meta_map: Dict[str, str]) -> str:
+    """
+    3순위: Instance 계열 스캔 (헤더 '순서' 우선)
+    - 'type' / 'class' 포함 헤더는 제외 (예: Instance Type 배제)
+    - 값 필터: Region/AZ/InstanceClass 제외
+    - ▶ Instance 헤더도 실제 식별자일 수 있어 노이즈 완화(이름형이면 허용)
+    - ARN은 그대로 허용
+    - RDS 식별자 패턴 허용
+    """
+    KEY_TOKENS = ("instance", "target group")
+    TOKENS_LC = tuple(t.lower() for t in KEY_TOKENS)
+
+    for h in (meta_headers or []):
+        k = _normalize(_s(h))
+        if any(tok in k for tok in TOKENS_LC):
+            if "type" in k or "class" in k:
+                continue  # Instance Type / Class 확실히 배제
+            v = (meta_map.get(k, "") or "").strip()
+            if not v:
+                continue
+            if _is_region_like(v) or AZ_RE.match(v):
+                continue
+            # ▶ 이름/식별자 성격이면 노이즈라도 허용 (ex. 'db instance'에 실제 식별자)
+            if (not _is_namey_header(k)) and _is_noise(v):
+                continue
+            if INSTANCE_CLASS_RE.match(v):
+                continue
+            if ARN_RE.match(v):
+                return v
+            if RDS_IDENTIFIER_RE.match(v):
+                return v
+            return v
+    return ""
+
+
+    def _accept(v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            return ""
+        if _is_region_like(v) or AZ_RE.match(v) or _is_noise(v) or INSTANCE_CLASS_RE.match(v):
+            return ""
+        if ARN_RE.match(v):
+            return v
+        if RDS_IDENTIFIER_RE.match(v):
+            return v
+        return v
+
+    for h in (meta_headers or []):
+        k = _normalize(_s(h))
+        if any(tok in k for tok in TOKENS_LC):
+            if "type" in k or "class" in k:
+                continue  # Instance Type / Class 확실히 배제
+            v = meta_map.get(k, "")
+            acc = _accept(v)
+            if acc:
+                return acc
+    return ""
+
+
 
 def pick_service_limits_combo(meta_headers: List[str], meta_map: Dict[str, str], check_name: str) -> str:
     n = _normalize(check_name)
@@ -483,19 +1113,73 @@ def pick_service_limits_combo(meta_headers: List[str], meta_map: Dict[str, str],
     status        = _get_by_synonyms_in_order(meta_headers, meta_map, SERVICE_LIMITS_SYNONYMS["status"])
 
     parts = [p for p in [region, service, limit_amount, current_usage, status] if p and not _is_noise(p)]
-    parts = [p for p in parts if not _is_region_like(p) or p != region]  # region 허용하되 단독 노출 방지
+    parts = [p for p in parts if not _is_region_like(p) or p != region]
     return " | ".join(parts) if parts else ""
 
-def pick_recommendation_summary(meta_headers: List[str], meta_map: Dict[str, str]) -> str:
+def pick_priority1_resource(meta_headers: List[str], meta_map: Dict[str, str], meta_vals: List[str], row_resource_id: str = "") -> str:
     """
-    8순위: 추천 요약을 최후 보루로 사용.
+    1순위: 헤더명이 ResourceId/Resource Id/Resource와 '정확히' 일치하면 그 값을 채택.
+    - region/AZ/노이즈는 제외
+    - 행 resourceId와 '값이 동일'하면 표시를 패스(난수/원시 ID 노출 방지)
+    - ARN/EC2 ID 등은 display_from_resource_id()로 풀어 사용
     """
-    targets = ["recommended resource summary", "recommendation summary"]
     for h in meta_headers or []:
         k = _normalize(_s(h))
-        if any(t == k for t in targets) or any(t in k for t in targets):
-            v = meta_map.get(k, "")
-            if v:
+        if k in TOP_RESOURCE_KEYS_EXACT:
+            v = (meta_map.get(k) or "").strip()
+            if not v:
+                continue
+            if row_resource_id and v.strip() == _s(row_resource_id).strip():
+                continue
+            if _is_region_like(v) or AZ_RE.match(v) or _is_noise(v):
+                continue
+            disp = display_from_resource_id(v, meta_vals)
+            return disp or v
+    return ""
+
+
+
+def pick_priority2_ident_name_instance(meta_headers: List[str], meta_map: Dict[str, str], meta_vals: List[str]) -> str:
+    """
+    2순위: Identifier / Name / Instance (이 순서, 헤더 '포함' 매칭, 헤더순서 우선)
+    - instance는 'type'/'class' 제외
+    - region/AZ/노이즈/인스턴스클래스 제외
+    - ARN/ID는 display_from_resource_id()로 정상화
+    """
+    def _accept(v: str) -> str:
+        v = (v or "").strip()
+        if not v or _is_region_like(v) or AZ_RE.match(v) or _is_noise(v) or INSTANCE_CLASS_RE.match(v):
+            return ""
+        disp = display_from_resource_id(v, meta_vals)
+        return disp or v
+
+    buckets = [
+        lambda key: ("identifier" in key and "type" not in key),
+        lambda key: (("name" in key) or ("이름" in key)),
+        lambda key: ("instance" in key and "type" not in key and "class" not in key),
+    ]
+
+    for pred in buckets:
+        for h in meta_headers or []:
+            k = _normalize(_s(h))
+            if pred(k):
+                got = _accept(meta_map.get(k, ""))
+                if got:
+                    return got
+    return ""
+
+
+# REPLACE (기존 pick_recommendation_summary 대체)
+def pick_recommendation_summary_exact(meta_headers: List[str], meta_map: Dict[str, str]) -> str:
+    """
+    5순위: 헤더명이 'recommended resource summary' 와 '정확히' 일치할 때만 사용.
+    (contains 매칭 금지)
+    """
+    for h in meta_headers or []:
+        k = _normalize(_s(h))
+        if k == "recommended resource summary":
+            v = (meta_map.get(k) or "").strip()
+            if v and not _is_noise(v):
                 return v
     return ""
 
@@ -514,195 +1198,261 @@ def build_full_combo(meta_headers: List[str], meta_map: Dict[str, str]) -> str:
         v = meta_map.get(key)
         if not v:
             continue
-        # 환경성 컬럼/값 배제
-        if "region" in key or "az" in key:
+
+        # 환경성/식별 불가 컬럼 제외
+        if any(tok in key for tok in ["region", "az", "availability zone", "vpc", "account id", "account", "aws account"]):
             continue
-        if _is_noise(v) or _is_region_like(v) or AZ_RE.match(v):
+
+        # 타입/클래스/스펙 계열 헤더 제외 (예: Instance Type, Class 등)
+        if any(tok in key for tok in ["instance type", "type", "class", "size", "engine version"]):
             continue
+
+        # 값 필터
+        if _is_noise(v) or _is_region_like(v) or AZ_RE.match(v) or INSTANCE_CLASS_RE.match(v):
+            continue
+
         out.append(v)
     return " | ".join(out) if out else ""
 
+# ───────────────────────────────────────────────────────────────────────────── 시작
+# 스캐너
+# 스캐너
+# 스캐너
+# 스캐너
+# 스캐너
+# 스캐너 / 조건식
+# 스캐너
+# 스캐너
+# 스캐너
+# 스캐너
+# 스캐너
+# ───────────────────────────────────────────────────────────────────────────── 시작
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 서비스별 조합/요약 (보조)
-# ─────────────────────────────────────────────────────────────────────────────
-def compose_combo_or_summary(check_name: str, meta_map: Dict[str, str], meta_vals: List[str]) -> str:
-    n = _normalize(check_name)
-
-    if ("service limit" in n) or ("service quota" in n):
-        fields = ["region", "service", "limit amount", "current usage", "status"]
-        parts = [meta_map.get(k, "") for k in fields if meta_map.get(k)]
-        parts = [p for p in parts if p and not _is_noise(p)]
-        if parts and len(parts) >= 2:
-            return " | ".join(parts)
-
-    if "unassociated elastic ip" in n or ("elastic ip" in n and "unassociated" in n):
-        region = meta_map.get("region") or meta_map.get("aws region") or ""
-        ip = meta_map.get("ip address") or meta_map.get("public ip address") or meta_map.get("public ip") or ""
-        alloc = meta_map.get("allocation id") or meta_map.get("allocation-id") or ""
-        parts = [x for x in [region, ip, alloc] if x and not _is_noise(x)]
-        if len(parts) >= 2:
-            return " | ".join(parts)
-
-    if ("savings plan" in n) or ("savings plans" in n) or ("purchase recommendation" in n) or ("reserved node" in n) or ("recommendation" in n):
-        for k, v in meta_map.items():
-            if ("recommended resource summary" in k) or ("recommendation summary" in k):
-                if v and not _is_noise(v):
-                    return v
-
-    return ""
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 메타의 'Resource Id'/'ResourceId'/'Resource'에서 ResourceId 대체 (1순위 그룹 내부, 보강)
-# ─────────────────────────────────────────────────────────────────────────────
-def _from_meta_resource_like(meta_map: Dict[str, str], meta_vals: List[str]) -> str:
-    # 우선순위: resource id → resourceid → resource → identifier
-    for key in ("resource id", "resourceid", "resource", "identifier"):
-        v = meta_map.get(key)
-        if not v:
-            continue
-
-        if key in ("resource id", "resourceid"):
-            disp = display_from_resource_id(v, meta_vals)
-            if disp:
-                return disp
-            continue
-
-        if key == "resource":
-            # 'resource'가 인스턴스 타입/리전/노이즈면 패스해서 다음 단계로
-            if INSTANCE_CLASS_RE.match(v) or _is_region_like(v) or _is_noise(v):
-                continue
-            if ARN_RE.match(v) or any(rx.search(v) for rx in [VOL_RE, I_RE, SG_RE, ENI_RE, SNAP_RE, TG_PATH_RE, ALB_PATH_RE, NLB_PATH_RE]):
-                disp = display_from_resource_id(v, meta_vals)
-                if disp:
-                    return disp
-                return v
-            if _is_human_name(v):
-                return v
-            continue
-
-        if key == "identifier":
-            # identifier 값도 동일한 기준으로 처리
-            if INSTANCE_CLASS_RE.match(v) or _is_region_like(v) or _is_noise(v):
-                continue
-            if ARN_RE.match(v) or any(rx.search(v) for rx in [VOL_RE, I_RE, SG_RE, ENI_RE, SNAP_RE, TG_PATH_RE, ALB_PATH_RE, NLB_PATH_RE]):
-                disp = display_from_resource_id(v, meta_vals)
-                if disp:
-                    return disp
-                return v
-            if _is_human_name(v):
-                return v
-
-    return ""
 
 
-# --- ADD: 1순위용 (메타) Identifier 추출기 (헤더 순서 존중)
-def _from_meta_identifier(meta_headers: List[str], meta_map: Dict[str, str], meta_vals: List[str]) -> str:
-    """
-    메타 헤더 중 'identifier'가 들어간 열을 헤더 순서대로 스캔하여 대표값 반환.
-    - 'type'이 붙은 헤더(예: 'instance type identifier')는 제외
-    - 값이 인스턴스 타입 토큰(예: db.t3.micro)인 경우 제외
-    - ARN/ID/경로면 축약 또는 그대로 반환
-    - 그 외에는 사람친화 값만 허용
-    """
-    for h in meta_headers or []:
-        k = _normalize(_s(h))
-        if "identifier" in k and "type" not in k:  # 'type' 포함 열은 제외
-            v = (meta_map.get(k) or "").strip()
-            if not v:
-                continue
-            # 값이 인스턴스 타입이면 제외
-            if INSTANCE_CLASS_RE.match(v):
-                continue
-            # 리전/노이즈 제외
-            if _is_region_like(v) or _is_noise(v):
-                continue
-            # ARN/ID/경로 형태면 축약 처리
-            if ARN_RE.match(v) or any(rx.search(v) for rx in [VOL_RE, I_RE, SG_RE, ENI_RE, SNAP_RE, TG_PATH_RE, ALB_PATH_RE, NLB_PATH_RE]):
-                disp = display_from_resource_id(v, meta_vals)
-                if disp:
-                    return disp
-                return v
-            # 사람친화 값이면 허용
-            if _is_human_name(v):
-                return v
-    return ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ───────────────────────────────────────────────────────────────────────────── 시작
+# 우선순위
+# 우선순위
+# 우선순위
+# 우선순위
 # 최종 표시 문자열 생성 — ★우선순위 체인 반영★
-# ─────────────────────────────────────────────────────────────────────────────
+# 우선순위
+# 우선순위
+# 우선순위
+# 우선순위
+# ───────────────────────────────────────────────────────────────────────────── 시작
 def compose_display(check_name: str, meta_headers: List[str], meta_values: List[str], resource_id: str) -> str:
     """
-    우선순위:
-    1) ResourceId / (메타) Resource Id / Resource(보강)
-    2) Name 포함 탭 (meta_headers 순서)
-    3) Strong
-    4) Instance 포함 탭/조합
-    5) 체크 전용 키
-    6) Service Limits/Quotas 조립 (Region | Service | Limit Amount | Current Usage | Status)
-    7) 전체 조합
-    8) Recommended Resource Summary / Recommendation Summary (최후 보루)
+    # 0-1) ★ EBS 전용: 체크명에 'EBS'가 포함되면 'Volume ID' 우선
+    # 0-2) ★ ECS 전용: Resource/Resource Id/ResourceId가 ECS ARN이면 마지막 '/' 뒤 전체 사용
+    # 1) Resource*
+    # 1-1) ★ Purchase Recommendations 전용: Recommended Resource Summary 우선
+    # 2) Identifier/Name
+    # 2-1) ★ Zone Balance 전용: 모든 메타 값 두 칸 공백으로 나열
+    # 3) Instance
+    # 3-1) NAT 전용: 체크명에 NAT가 포함되면 NAT ID / Nat Gateway ID 우선
+    # 3-2) Password Policy 전용: 모든 헤더:값을 두 칸 간격으로 나열
+    # 3-3) ★ IAM Access Analyzer 전용: Region만 표시
+    # 3-4) ★ IAM Access Key Rotation 전용: IAM User + Reason
+    # 4) Strong
+    # 5) 체크 전용
+    # 6) Recommended Resource Summary
+    # 7) Region | Reason
+    # 8) 전체 조합
     """
     meta_vals = [_s(v) for v in (meta_values or []) if _s(v)]
     meta_map = _dict_from_meta(meta_headers, meta_vals)
 
-# --- REPLACE THE PRIORITY BLOCK INSIDE compose_display() ---
-    # 1) ResourceId / (메타) Resource Id / (메타) Resource / (메타) Identifier
-    v1 = display_from_resource_id(resource_id, meta_vals)
-    if v1:
-        return v1
-    v1b = _from_meta_resource_like(meta_map, meta_vals)  # resource id / resourceid / resource / identifier (정확키)
-    if v1b:
-        return v1b
-    v1c = _from_meta_identifier(meta_headers, meta_map, meta_vals)  # 헤더 순서 기준 '...identifier...' 열
-    if v1c:
-        return v1c
+    # if _trace_on(check_name):
+    #     _trace_candidates(check_name, meta_headers, meta_map)
+    #     #_log("row.resourceId:", resource_id)
 
-    # 2) 헤더에 Name 포함 (예: DB Instance Name, Load Balancer Name, …)
-    v2 = pick_name_tab(meta_headers, meta_map)
+    # 0-1) ★ EBS 전용: 체크명에 'EBS'가 포함되면 'Volume ID' 우선
+    if _is_ebs_check(check_name):
+        v0_ebs = pick_ebs_volume_id_preferred(meta_headers, meta_map)
+        if v0_ebs:
+            return v0_ebs
+
+    # 0-2) ★ ECS 전용: Resource/Resource Id/ResourceId가 ECS ARN이면 마지막 '/' 뒤 전체 사용
+    if _is_ecs_check(check_name):
+        v0_ecs = pick_ecs_resource_tail(meta_headers, meta_map)
+        if v0_ecs:
+            return v0_ecs
+
+    # 1) Resource*
+    v1 = pick_priority1_resource(meta_headers, meta_map, meta_vals, row_resource_id=resource_id)
+    if v1:
+        # if _trace_on(check_name):
+         #_log("→ PICK[1] Resource* :", v1)
+        return v1
+    # else:
+    #     if _trace_on(check_name):
+         #_log("× MISS[1] Resource*")
+
+    # 1-1) ★ Purchase Recommendations 전용: Recommended Resource Summary 우선
+    if _is_purchase_reco_check(check_name):
+        v2pr = pick_recommendation_summary_exact(meta_headers, meta_map)
+        if v2pr:
+            return v2pr
+
+    # 2) Identifier/Name
+    v2 = pick_id_name_tab(meta_headers, meta_map)
     if v2:
+        # if _trace_on(check_name):
+        #   #_log("→ PICK[2] Name/Identifier :", v2)
         return v2
+    # else:
+    #     if _trace_on(check_name):_log("× MISS[2] Name/Identifier")
+
+    # 2-1) ★ Zone Balance 전용: 모든 메타 값 두 칸 공백으로 나열
+    if _is_zone_balance_check(check_name):
+        v2z = pick_zone_balance_all_values(meta_headers, meta_vals)
+        if v2z:
+            return v2z
+
+    # 3) Instance
+    v3i = pick_instance_tab(meta_headers, meta_map)
+    if v3i:
+        # if _trace_on(check_name):
+        #     #_log("→ PICK[3] Instance :", v3i)
+        return v3i
+    # else:
+    #     if _trace_on(check_name):
+    #         #_log("× MISS[3] Instance")
+
+    # 3-1) NAT 전용: 체크명에 NAT가 포함되면 NAT ID / Nat Gateway ID 우선
+    if _is_nat_check(check_name):
+        v4_nat = pick_nat_id_preferred(meta_headers, meta_map)
+        if v4_nat:
+            return v4_nat
+
+    # 3-2) Password Policy 전용: 모든 헤더:값을 두 칸 간격으로 나열
+    if _is_password_policy_check(check_name):
+        v_pp = pick_password_policy_all_kv(meta_headers, meta_vals)
+        if v_pp:
+            return v_pp
+
+    # 3-3) ★ IAM Access Analyzer 전용: Region만 표시
+    if _is_iam_access_analyzer_check(check_name):
+        v_aa = pick_region_only(meta_headers, meta_map)
+        if v_aa:
+            return v_aa
+
+    # 3-4) ★ IAM Access Key Rotation 전용: IAM User + Reason
+    if _is_iam_ak_rotation_check(check_name):
+        v_akr = pick_iam_user_plus_reason(meta_headers, meta_map)
+        if v_akr:
+            return v_akr
 
     # 4) Strong
     v4 = pick_strong_meta_id(meta_map, meta_vals)
     if v4:
+        # if _trace_on(check_name):
+        # #_log("→ PICK[4] Strong :", v4)
         return v4
+    # else:
+    #     if _trace_on(check_name):
+    #         #_log("× MISS[4] Strong")
 
-    # 5) Instance가 들어간 탭/조합
-    v5 = pick_instance_tab(meta_headers, meta_map)
+    # 5) 체크 전용
+    v5 = pick_check_specific(check_name, meta_map, meta_headers, meta_vals)
     if v5:
+        # if _trace_on(check_name):
+        # #_log("→ PICK[5] CheckSpecific :", v5)
         return v5
+    # else:
+    #     if _trace_on(check_name):
+    #         #_log("× MISS[5] CheckSpecific")
 
-    # 6) Check 전용 키
-    v6 = pick_check_specific(check_name, meta_map)
+    # 6) Recommended Resource Summary
+    v6 = pick_recommendation_summary_exact(meta_headers, meta_map)
     if v6:
+        # if _trace_on(check_name):
+        #     #_log("→ PICK[6] RecResourceSummary :", v6)
         return v6
+    # else:
+    #     if _trace_on(check_name):
+    #         #_log("× MISS[6] RecResourceSummary")
 
-    # 7) 특정 조합 (Region | Reason)
+    # 7) Region | Reason
     v7 = build_region_reason_combo(meta_map)
     if v7:
+        # if _trace_on(check_name):
+        #     #_log("→ PICK[7] Region|Reason :", v7)
         return v7
-
-    # 👉 안전장치: 1~6단계가 비어서 7번(전체 조합)으로 가기 직전,
-    #    'instance' 헤더 값이 있으면 그걸 우선 채택 (우선순위 보존)
-    inst_guard = pick_instance_tab(meta_headers, meta_map)
-    if inst_guard:
-        return inst_guard
-
+    # else:
+    #     if _trace_on(check_name):
+    #         #_log("× MISS[7] Region|Reason")
 
     # 8) 전체 조합
     v8 = build_full_combo(meta_headers, meta_map)
     if v8:
+        # if _trace_on(check_name):
+        #     #_log("→ PICK[8] FullCombo :", v8)
         return v8
 
-    return ""
+    # if _trace_on(check_name):
+        #_log("→ PICK[?] EMPTY")
+    # return ""
+
+# ───────────────────────────────────────────────────────────────────────────── 끝
+# 우선순위
+# 우선순위
+# 우선순위
+# 우선순위
+# 최종 표시 문자열 생성 — ★우선순위 체인 반영★
+# 우선순위
+# 우선순위
+# 우선순위
+# 우선순위
+# ───────────────────────────────────────────────────────────────────────────── 끝
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+
+# ───────────────────────────────────────────────────────────────────────────── 시작
+# 상태 카운트
+# 상태 카운트
+# 상태 카운트
+# 상태 카운트
+# 상태 카운트
 # TA 결과 조회 : 상태 카운트 + (주의/경고)별 표시 문자열 목록
-# ─────────────────────────────────────────────────────────────────────────────
+# 상태 카운트
+# 상태 카운트
+# 상태 카운트
+# 상태 카운트
+# 상태 카운트
+# ───────────────────────────────────────────────────────────────────────────── 시작
 def fetch_check_result_summary(
     support, check_id: str, meta_headers: List[str], check_name: str
 ) -> Tuple[int, int, int, int, str, Dict[str, List[str]]]:
@@ -740,9 +1490,13 @@ def fetch_check_result_summary(
             st_raw = (r.get("status") or "").lower().strip()
             rid = _s(r.get("resourceId")).strip()
             is_suppressed = bool(r.get("isSuppressed"))
-            meta_vals = [ _s(v) for v in (r.get("metadata") or []) ]
+            meta_vals = [_s(v) for v in (r.get("metadata") or [])]
 
-            _debug_print_meta_for_rds_backups(check_name, meta_headers, meta_vals, rid, st_raw)
+            # 이 구간 디버그용
+            # 이 구간 디버그용
+            #_debug_print_meta_for_rds_backups(check_name, meta_headers, meta_vals, rid, st_raw)
+            # 이 구간 디버그용
+            # 이 구간 디버그용
 
             display_text = compose_display(check_name, meta_headers, meta_vals, rid)
 
@@ -767,9 +1521,48 @@ def fetch_check_result_summary(
     overall = STATUS_MAP_FINAL.get(result_status_raw, "미확인")
     return error_count, warn_count, ok_count, excluded_count, overall, status_to_texts
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────── 끝
+# 상태 카운트
+# 상태 카운트
+# 상태 카운트
+# 상태 카운트
+# 상태 카운트
+# TA 결과 조회 : 상태 카운트 + (주의/경고)별 표시 문자열 목록
+# 상태 카운트
+# 상태 카운트
+# 상태 카운트
+# 상태 카운트
+# 상태 카운트
+# ───────────────────────────────────────────────────────────────────────────── 끝
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ───────────────────────────────────────────────────────────────────────────── 시작
+# 리소스값 문자열 생성
+# 리소스값 문자열 생성
+# 리소스값 문자열 생성
+# 리소스값 문자열 생성
+# 리소스값 문자열 생성
 # 문자열 유틸 및 "리소스 값" 문자열 생성
-# ─────────────────────────────────────────────────────────────────────────────
+# 리소스값 문자열 생성
+# 리소스값 문자열 생성
+# 리소스값 문자열 생성
+# 리소스값 문자열 생성
+# 리소스값 문자열 생성
+# ───────────────────────────────────────────────────────────────────────────── 시작
 def split_on_commas(s: str) -> List[str]:
     s = _s(s)
     if not s:
@@ -934,11 +1727,34 @@ def main():
             col_idx = df_all.columns.get_loc("소스 종류") + 1
             ws.column_dimensions[get_column_letter(col_idx)].width = 28
 
+# ───────────────────────────────────────────────────────────────────────────── 끝
+# 리소스값 문자열 생성
+# 리소스값 문자열 생성
+# 리소스값 문자열 생성
+# 리소스값 문자열 생성
+# 리소스값 문자열 생성
+# 문자열 유틸 및 "리소스 값" 문자열 생성
+# 리소스값 문자열 생성
+# 리소스값 문자열 생성
+# 리소스값 문자열 생성
+# 리소스값 문자열 생성
+# 리소스값 문자열 생성
+# ───────────────────────────────────────────────────────────────────────────── 끝
+
+
+
+
+# ───────────────────────────────────────────────────────────────────────────── 시작
+# 콘솔 로그 결과값 멘트
+# ───────────────────────────────────────────────────────────────────────────── 시작
+
     print(f"완료: {OUTPUT_XLSX} 생성 (All 시트)")
     if sample_preview:
         print(f"[PREVIEW] 첫 번째 '리소스 값' (개행표시=⏎): {sample_preview}")
-    print(" - 새 우선순위 적용: ResourceId/Resource(보강) → Name(헤더순서) → Strong → Instance → Check전용 → ServiceLimits조합 → 전체조합 → 추천요약")
-    print(" - 난수형 메타토큰/리전 단독/타입토큰은 필터링")
+    print(
+        " - 새 우선순위 적용: Resource*값-일치확인(동일값은 패스) → Identifier/Name(헤더순서) → Instance(헤더순서,type/class제외) → Strong → 체크전용 → Recommended Summary → Region|Reason → 전체조합")
+    print(" - 난수형 메타토큰/리전 단독/AZ/타입토큰(instance type/class 등)은 필터링")
+
     print(f"[INFO] Script version: {VERSION}")
 
 if __name__ == "__main__":
